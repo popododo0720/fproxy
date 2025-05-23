@@ -1,0 +1,32 @@
+[package]
+name = "udss-proxy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+nix = { version = "0.30.1", features = ["socket", "resource", "zerocopy", "net"] }
+log = "0.4.27"
+once_cell = "1.21.3"
+env_logger = "0.11.8"
+num_cpus = "1.16.0"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_yml = "0.0.12"
+time = "0.3.41"
+bytes = "1.10.1"
+socket2 = "0.5.9"
+
+#rustls = "0.22.2"
+rustls = "0.23.27"
+#tokio-rustls = "0.25.0"
+tokio-rustls = "0.26.2"
+rcgen = "0.12.0"
+#rcgen = "0.13.2"
+rustls-native-certs = "0.7.0"
+#rustls-native-certs = "0.8.1"
+
+[profile.release]
+opt-level = 3      # 최적화 수준 3
+lto = true         # Link Time Optimization 활성화
+panic = 'abort'    # 패닉 시 프로그램 종료
+codegen-units = 1  # 빌드 단위 최소화

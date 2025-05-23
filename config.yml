@@ -1,0 +1,15 @@
+# example
+
+
+bind_host: "0.0.0.0"
+bind_port: 8080
+buffer_size: 65536  # 64KB
+timeout_ms: 30000   # 30초
+tls_inspection: true
+ssl_dir: "ssl"
+worker_threads: 4  # CPU 코어 수를 기본값으로 설정하려면 null로 설정
+cache_enabled: true
+cache_size: 1000    # 최대 캐시 항목 수
+cache_ttl_seconds: 300  # 캐시 항목 유효 시간
+tls_verify_certificate: true  # TLS 인증서 검증 활성화/비활성화
+access_control: {} 
