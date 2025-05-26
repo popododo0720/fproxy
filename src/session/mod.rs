@@ -6,7 +6,7 @@ use std::os::unix::io::{AsRawFd};
 use std::os::unix::io::FromRawFd;
 
 use bytes::BytesMut;
-use log::{trace, debug, info, error, warn};
+use log::{trace, debug, info, error};
 use tokio::net::TcpStream;
 use socket2::{Socket};
 use tokio::io::AsyncReadExt;
@@ -170,7 +170,7 @@ impl Session {
                     info!("[Session:{}] Connected to real server {} over TLS", self.session_id(), host);
                     
                     // 3. 중간에서 데이터 가로채기
-                    proxy_tls_streams(tls_stream, real_tls_stream, Arc::clone(&self.metrics), &self.session_id()).await?;
+                    proxy_tls_streams(tls_stream, real_tls_stream, Arc::clone(&self.metrics), &self.session_id(), &host).await?;
                     
                     // 연결 종료 시 활성 연결 카운트 감소
                     self.metrics.connection_closed(true);

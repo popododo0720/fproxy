@@ -168,30 +168,6 @@ pub async fn generate_fake_cert(host: &str) -> Result<CertKeyPair, Box<dyn Error
     
     let private_key = PrivateKeyDer::Pkcs8(key_der.into());
     
-    // // 인증서를 캐시에 저장 - 복사본 저장
-    // {
-    //     let mut cache = CERT_CACHE.lock().unwrap();
-    //
-    //     // 키 복제
-    //     let private_key_to_cache = match &private_key {
-    //         PrivateKeyDer::Pkcs8(key) => {
-    //             let key_data = key.secret_pkcs8_der().to_vec();
-    //             PrivateKeyDer::Pkcs8(key_data.into())
-    //         },
-    //         PrivateKeyDer::Sec1(key) => {
-    //             let key_data = key.secret_sec1_der().to_vec();
-    //             PrivateKeyDer::Sec1(key_data.into())
-    //         },
-    //         PrivateKeyDer::Pkcs1(key) => {
-    //             let key_data = key.secret_pkcs1_der().to_vec();
-    //             PrivateKeyDer::Pkcs1(key_data.into())
-    //         },
-    //         _ => return Err("Unsupported private key format".into()),
-    //     };
-    //
-    //     cache.insert(host.to_string(), (cert_chain.clone(), private_key_to_cache));
-    // }
-    
     Ok((cert_chain, private_key))
 }
 
