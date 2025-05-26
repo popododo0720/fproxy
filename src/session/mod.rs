@@ -7,9 +7,9 @@ use std::os::unix::io::FromRawFd;
 
 use bytes::BytesMut;
 use log::{trace, debug, info, error};
-use tokio::net::TcpStream;
 use socket2::{Socket};
-use tokio::io::AsyncReadExt;
+use tokio::net::TcpStream;
+use tokio::io::{AsyncReadExt,AsyncWriteExt};
 
 use crate::metrics::Metrics;
 use crate::config::Config;
@@ -19,6 +19,7 @@ use crate::tls::{generate_fake_cert, accept_tls_with_cert, connect_tls};
 use crate::proxy::{proxy_http_streams, proxy_tls_streams};
 use crate::acl::domain_blocker::DomainBlocker;
 use crate::acl::block_page::BlockPage;
+use crate::acl::request_logger::RequestLogger;
 
 
 pub struct Session {
@@ -225,10 +226,47 @@ impl Session {
             // HTTP 요청 처리
             info!("[Session:{}] Processing HTTP request for {}", self.session_id(), host);
             
+            // 요청 로그 파일 생성
+            let mut request_log_file = RequestLogger::create_log_file(&host, &self.session_id()).await;
+            
             // 서버에 연결
             let server_addr = format!("{}:{}", host, port);
             let server_stream = match TcpStream::connect(&server_addr).await {
-                Ok(stream) => stream,
+                Ok(stream) => {
+                    // 실제 연결된 IP 주소 확인 및 로깅
+                    if let Some(file) = &mut request_log_file {
+                        if let Ok(peer_addr) = stream.peer_addr() {
+                            let ip_line = format!("# Connected to IP: {}\n# --------------------\n", peer_addr.ip());
+                            if let Err(e) = file.write_all(ip_line.as_bytes()).await {
+                                error!("[Session:{}] Failed to write connected IP to log file: {}", self.session_id(), e);
+                            }
+                            info!("[Session:{}] Connected to IP: {} for host: {}", self.session_id(), peer_addr.ip(), host);
+                        }
+                        
+                        // 첫 번째 HTTP 요청 로깅
+                        let request_str = String::from_utf8_lossy(&buffer[0..n]);
+                        let mut log_content = String::new();
+                        
+                        for line in request_str.lines() {
+                            // 필요한 헤더만 로깅
+                            if line.starts_with("GET ") || line.starts_with("POST ") || 
+                               line.starts_with("PUT ") || line.starts_with("DELETE ") || 
+                               line.starts_with("HEAD ") || line.starts_with("OPTIONS ") ||
+                               line.to_lowercase().starts_with("host:") ||
+                               line.to_lowercase().starts_with("user-agent:") ||
+                               line.to_lowercase().starts_with("referer:") ||
+                               line.to_lowercase().starts_with("sec-ch-ua-platform:") {
+                                log_content.push_str(&format!("{}\n", line));
+                            }
+                        }
+                        
+                        if let Err(e) = file.write_all(format!("{}\n\n", log_content).as_bytes()).await {
+                            error!("[Session:{}] Failed to write initial HTTP request to log file: {}", self.session_id(), e);
+                        }
+                    }
+                    
+                    stream
+                },
                 Err(e) => {
                     error!("[Session:{}] Failed to connect to target server {}: {}", self.session_id(), server_addr, e);
                     return Err(e.into());

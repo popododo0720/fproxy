@@ -21,6 +21,12 @@ pub async fn proxy_tls_streams(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     // 양방향 데이터 전송 및 검사 로직 구현
     let (mut client_read, mut client_write) = tokio::io::split(client_stream);
+    
+    // 연결된 IP 주소 가져오기
+    let connected_ip = server_stream.get_ref().0.peer_addr()
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_else(|_| "Unknown IP".to_string());
+        
     let (mut server_read, mut server_write) = tokio::io::split(server_stream);
     
     // 바이트 카운터 초기화
@@ -30,6 +36,15 @@ pub async fn proxy_tls_streams(
         
         // 요청 저장을 위한 파일 생성
         let mut request_log_file = RequestLogger::create_log_file(host, session_id).await;
+        
+        // 연결된 IP 주소 로깅
+        if let Some(file) = &mut request_log_file {
+            let ip_line = format!("# Connected to IP: {}\n# --------------------\n", connected_ip);
+            if let Err(e) = file.write_all(ip_line.as_bytes()).await {
+                error!("[Session:{}] Failed to write connected IP to log file: {}", session_id, e);
+            }
+            info!("[Session:{}] Connected to IP: {} for host: {}", session_id, connected_ip, host);
+        }
         
         // 누적 버퍼 (HTTP 요청이 여러 패킷으로 나뉘어 올 경우를 대비)
         let mut accumulated_data = Vec::new();

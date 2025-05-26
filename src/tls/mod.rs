@@ -297,6 +297,11 @@ pub async fn connect_tls(host: &str, config: &Config) -> Result<ClientTlsStream<
     // 서버에 연결
     let tcp_stream = TcpStream::connect(format!("{}:443", host)).await?;
     
+    // 연결된 실제 IP 주소 로깅
+    if let Ok(peer_addr) = tcp_stream.peer_addr() {
+        info!("Connected to IP: {} for host: {}", peer_addr.ip(), host);
+    }
+    
     // TLS 핸드셰이크 수행
     let domain = rustls::pki_types::ServerName::try_from(host)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid DNS name"))?
