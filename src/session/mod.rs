@@ -180,7 +180,6 @@ impl Session {
                     // UnknownIssuer 오류 발생 시 설정 안내
                     if e.to_string().contains("UnknownIssuer") {
                         error!("[Session:{}] 서버 인증서 검증 실패: {}", self.session_id(), e);
-                        warn!("[Session:{}] 인증서 검증을 비활성화하려면 설정에서 tls_verify_certificate=false로 설정하세요", self.session_id());
                     }
                     return Err(e);
                 }

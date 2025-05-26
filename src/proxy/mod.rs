@@ -161,7 +161,6 @@ pub async fn proxy_tls_streams(
         }
         
         debug!("[Session:{}] Client to server transfer finished: {} bytes", session_id, total_bytes);
-        info!("[Session:{}] 최종 클라이언트→서버 전송량: {} bytes", session_id, total_bytes);
         Ok::<u64, io::Error>(total_bytes)
     };
     
