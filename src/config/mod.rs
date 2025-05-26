@@ -26,10 +26,10 @@ pub struct Config {
 impl Config {
     pub fn new() -> Self {
         let mut blocked_domains = HashSet::new();
-        blocked_domains.insert("naver.com".to_string());
+        blocked_domains.insert("nexon.com".to_string());
         
         let mut blocked_patterns = HashSet::new();
-        blocked_patterns.insert("*.naver.com".to_string());
+        blocked_patterns.insert("*.nexon.com".to_string());
         
         let config = Self {
             bind_host: "0.0.0.0".to_string(),

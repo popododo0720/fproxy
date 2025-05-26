@@ -1,6 +1,5 @@
 use std::sync::Arc;
-use std::collections::HashSet;
-use log::{info, debug};
+use log::{info};
 
 use crate::config::Config;
 
@@ -43,19 +42,19 @@ impl DomainBlocker {
         false
     }
     
-    /// 대규모 도메인 목록 로드 (향후 확장용)
-    pub fn load_blocklist(&mut self, _path: &str) -> Result<(), std::io::Error> {
-        // 파일에서 대규모 차단 목록 로드 구현
-        // 예: CSV, JSON 등에서 도메인 목록 로드
+    // /// 대규모 도메인 목록 로드 (향후 확장용)
+    // pub fn load_blocklist(&mut self, _path: &str) -> Result<(), std::io::Error> {
+    //     // 파일에서 대규모 차단 목록 로드 구현
+    //     // 예: CSV, JSON 등에서 도메인 목록 로드
         
-        debug!("도메인 차단 목록 로드 완료");
-        Ok(())
-    }
+    //     debug!("도메인 차단 목록 로드 완료");
+    //     Ok(())
+    // }
     
-    /// 트라이(Trie) 자료구조 구축 (향후 확장용)
-    fn build_domain_trie(&self, _domains: &HashSet<String>) {
-        // 도메인 트라이 구축 로직
-        // 서브도메인 패턴 매칭을 위한 효율적인 자료구조
-    }
+    // /// 트라이(Trie) 자료구조 구축 (향후 확장용)
+    // fn build_domain_trie(&self, _domains: &HashSet<String>) {
+    //     // 도메인 트라이 구축 로직
+    //     // 서브도메인 패턴 매칭
+    // }
     
 } 
