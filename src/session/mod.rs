@@ -18,6 +18,7 @@ use crate::buffer::BufferPool;
 use crate::constants::*;
 use crate::tls::{generate_fake_cert, accept_tls_with_cert, connect_tls};
 use crate::proxy::{proxy_http_streams, proxy_tls_streams};
+use crate::acl::domain_blocker::DomainBlocker;
 
 
 pub struct Session {
@@ -27,6 +28,7 @@ pub struct Session {
     config: Arc<Config>,
     buffer_pool: Option<Arc<BufferPool>>,
     start_time: Instant,
+    domain_blocker: Arc<DomainBlocker>,
 }
 
 impl Session {
@@ -34,10 +36,11 @@ impl Session {
         Self {
             client_stream: Some(client_stream),
             client_addr,
-            metrics,
-            config,
+            metrics: Arc::clone(&metrics),
+            config: Arc::clone(&config),
             buffer_pool,
             start_time: Instant::now(),
+            domain_blocker: Arc::new(DomainBlocker::new(Arc::clone(&config))),
         }
     }
 
@@ -150,7 +153,7 @@ impl Session {
             }
         };
 
-        if self.is_blocked_domain(&host) {
+        if self.domain_blocker.is_blocked(&host) {
             info!("[Session:{}] Blocked access to domain: {}", self.session_id(), host);
             
             if !is_connect {
@@ -427,36 +430,5 @@ impl Session {
         std::mem::forget(sock);
 
         Ok(())
-    }
-
-    // 차단된 도메인인지 확인
-    fn is_blocked_domain(&self, host: &str) -> bool {
-        // 도메인 패턴 차단 로직
-        let host_lower = host.to_lowercase();
-        
-        // 1. 정확한 도메인 매칭 (예: "naver.com")
-        if self.config.blocked_domains.contains(&host_lower) {
-            info!("[Session:{}] 차단된 도메인 감지 (정확히 일치): {}", self.session_id(), host);
-            return true;
-        }
-        
-        // 2. 와일드카드 패턴 매칭 (예: "*.naver.com")
-        for pattern in &self.config.blocked_patterns {
-            if pattern.starts_with("*.") {
-                // *.example.com 형식의 패턴
-                let domain_suffix = &pattern[1..]; // "*.example.com" -> ".example.com"
-                if host_lower.ends_with(domain_suffix) {
-                    info!("[Session:{}] 차단된 도메인 감지 (와일드카드 패턴 {} 일치): {}", 
-                          self.session_id(), pattern, host);
-                    return true;
-                }
-            }
-            // 추가 패턴 형식을 여기에 구현할 수 있음
-        }
-        
-        // 나중에 대규모 차단 목록을 처리
-        // 1. HashMap<String, bool>로 정확한 도메인 매칭
-        // 2. 트라이(Trie) 자료구조로 서브도메인 패턴 매칭
-        false
     }
 }

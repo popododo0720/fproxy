@@ -13,6 +13,7 @@ mod server;
 mod session;
 mod tls;
 mod proxy;
+mod acl;
 
 use config::Config;
 use metrics::Metrics;
