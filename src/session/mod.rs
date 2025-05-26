@@ -6,10 +6,11 @@ use std::os::unix::io::{AsRawFd};
 use std::os::unix::io::FromRawFd;
 
 use bytes::BytesMut;
-use log::{trace, debug, info, error};
+use log::{trace, debug, info, error, warn};
 use tokio::net::TcpStream;
 use socket2::{Socket};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use chrono;
 
 use crate::metrics::Metrics;
 use crate::config::Config;
@@ -43,11 +44,11 @@ impl Session {
     pub async fn handle(mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
         trace!("[Session:{}] session start, addr: {}", self.session_id(), self.client_addr);
 
-        let mut client_stream = self.client_stream.take().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "no client stream")
-        })?;
+        let mut client_stream = match self.client_stream.take() {
+            Some(stream) => stream,
+            None => return Ok(())
+        };
 
-        // tcp 최적화
         self.optimize_tcp(&client_stream)?;
 
         let mut buffer = if let Some(pool) = &self.buffer_pool {
@@ -149,6 +150,116 @@ impl Session {
             }
         };
 
+        if self.is_blocked_domain(&host) {
+            info!("[Session:{}] Blocked access to domain: {}", self.session_id(), host);
+            
+            if !is_connect {
+                // HTTP 요청의 경우 직접 차단 페이지 반환
+                let blocked_message = format!("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n\
+                <!DOCTYPE html>\
+                <html>\
+                <head>\
+                    <title>사이트 접근 차단됨</title>\
+                    <meta charset=\"UTF-8\">\
+                    <style>\
+                        body {{ font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f5f5f5; }}\
+                        .container {{ max-width: 800px; margin: 40px auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}\
+                        h1 {{ color: #e74c3c; margin-top: 0; }}\
+                        .info {{ background-color: #f8f9fa; padding: 15px; border-left: 4px solid #e74c3c; margin: 20px 0; }}\
+                        .button {{ display: inline-block; background-color: #3498db; color: white; padding: 10px 20px; text-decoration: none; border-radius: 4px; margin-top: 20px; }}\
+                    </style>\
+                </head>\
+                <body>\
+                    <div class=\"container\">\
+                        <h1>접속이 차단되었습니다</h1>\
+                        <p>관리자 정책에 따라 요청하신 사이트에 대한 접속이 차단되었습니다.</p>\
+                        <div class=\"info\">\
+                            <p><strong>차단된 도메인:</strong> {}</p>\
+                            <p><strong>차단 시간:</strong> {}</p>\
+                        </div>\
+                        <p>문의사항이 있으시면 네트워크 관리자에게 연락하세요.</p>\
+                    </div>\
+                </body>\
+                </html>", 
+                host, 
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"), 
+                );
+                
+                client_stream.try_write(blocked_message.as_bytes())?;
+                
+                if let Some(pool) = self.buffer_pool {
+                    pool.return_buffer(buffer);
+                }
+                
+                return Ok(());
+            } else {
+                // HTTPS 요청(CONNECT)의 경우:
+                // 1. 일단 CONNECT 요청을 승인하고 TLS 핸드셰이크 진행
+                let response = "HTTP/1.1 200 Connection Established\r\nConnection: keep-alive\r\n\r\n";
+                client_stream.try_write(response.as_bytes())?;
+                info!("[Session:{}] CONNECT request approved for {} (will be blocked after TLS handshake)", self.session_id(), host);
+                
+                // 2. 가짜 인증서로 클라이언트와 TLS 연결 수립
+                let fake_cert = generate_fake_cert(&host).await?;
+                let mut tls_stream = accept_tls_with_cert(client_stream, fake_cert).await?;
+                info!("[Session:{}] Established TLS with client for blocked domain {}", self.session_id(), host);
+                
+                // 3. TLS 연결 후 HTML 차단 페이지 전송
+                let blocked_html = format!("\
+                HTTP/1.1 403 Forbidden\r\n\
+                Connection: close\r\n\
+                Content-Type: text/html; charset=UTF-8\r\n\
+                \r\n\
+                <!DOCTYPE html>\
+                <html>\
+                <head>\
+                    <title>사이트 접근 차단됨 (HTTPS)</title>\
+                    <meta charset=\"UTF-8\">\
+                    <style>\
+                        body {{ font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f5f5f5; }}\
+                        .container {{ max-width: 800px; margin: 40px auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}\
+                        h1 {{ color: #e74c3c; margin-top: 0; }}\
+                        .info {{ background-color: #f8f9fa; padding: 15px; border-left: 4px solid #e74c3c; margin: 20px 0; }}\
+                        .warning {{ background-color: #fff3cd; padding: 15px; border-left: 4px solid #ffc107; margin: 20px 0; }}\
+                        .button {{ display: inline-block; background-color: #3498db; color: white; padding: 10px 20px; text-decoration: none; border-radius: 4px; margin-top: 20px; }}\
+                    </style>\
+                </head>\
+                <body>\
+                    <div class=\"container\">\
+                        <h1>보안 연결이 차단되었습니다</h1>\
+                        <p>관리자 정책에 따라 요청하신 보안 사이트(HTTPS)에 대한 접속이 차단되었습니다.</p>\
+                        <div class=\"warning\">\
+                            <p><strong>참고:</strong> 이 페이지는 TLS 연결이 성공적으로 수립된 후 표시됩니다. 프록시 서버에서 제공하는 인증서를 사용하여 암호화된 연결이 설정되었습니다.</p>\
+                        </div>\
+                        <div class=\"info\">\
+                            <p><strong>차단된 도메인:</strong> {}</p>\
+                            <p><strong>차단 시간:</strong> {}</p>\
+                        </div>\
+                        <p>문의사항이 있으시면 네트워크 관리자에게 연락하세요.</p>\
+                    </div>\
+                </body>\
+                </html>", 
+                host, 
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"), 
+                );
+                
+                // TLS 스트림으로 차단 페이지 전송
+                if let Err(e) = tls_stream.write_all(blocked_html.as_bytes()).await {
+                    error!("[Session:{}] Failed to send TLS blocked page: {}", self.session_id(), e);
+                }
+                
+                // 연결 종료 시 활성 연결 카운트 감소
+                self.metrics.connection_closed(true);
+                info!("[Session:{}] Sent blocked page over TLS for {}", self.session_id(), host);
+                
+                if let Some(pool) = self.buffer_pool {
+                    pool.return_buffer(buffer);
+                }
+                
+                return Ok(());
+            }
+        }
+
         self.metrics.increment_request_count(is_connect);
 
         if is_connect {
@@ -190,7 +301,7 @@ impl Session {
             
             // 서버에 연결
             let server_addr = format!("{}:{}", host, port);
-            let mut server_stream = match TcpStream::connect(&server_addr).await {
+            let server_stream = match TcpStream::connect(&server_addr).await {
                 Ok(stream) => stream,
                 Err(e) => {
                     error!("[Session:{}] Failed to connect to target server {}: {}", self.session_id(), server_addr, e);
@@ -245,5 +356,9 @@ impl Session {
         std::mem::forget(sock);
 
         Ok(())
+    }
+
+    fn is_blocked_domain(&self, host: &str) -> bool {
+        host.eq_ignore_ascii_case("www.naver.com")
     }
 }
