@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::fs::File;
 use std::io::Read;
+use std::collections::HashSet;
 
 use serde::{Serialize, Deserialize};
 
@@ -18,10 +19,18 @@ pub struct Config {
     pub cache_ttl_seconds: u64,
     pub tls_verify_certificate: bool,
     pub access_control: AccessControlConfig,
+    pub blocked_domains: HashSet<String>,
+    pub blocked_patterns: HashSet<String>,
 }
 
 impl Config {
     pub fn new() -> Self {
+        let mut blocked_domains = HashSet::new();
+        blocked_domains.insert("naver.com".to_string());
+        
+        let mut blocked_patterns = HashSet::new();
+        blocked_patterns.insert("*.naver.com".to_string());
+        
         let config = Self {
             bind_host: "0.0.0.0".to_string(),
             bind_port: 50000,
@@ -35,6 +44,8 @@ impl Config {
             cache_ttl_seconds: 300,
             tls_verify_certificate: true,
             access_control: AccessControlConfig {},
+            blocked_domains,
+            blocked_patterns,
         };
 
         config
