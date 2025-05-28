@@ -2,11 +2,13 @@ use log::{debug, error, info};
 use tokio::io::AsyncWriteExt;
 use tokio::fs::File;
 use tokio::sync::mpsc::{self, Sender, Receiver};
+use tokio::time::{sleep, Duration as TokioDuration};
 use std::collections::{VecDeque, HashMap};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 use std::borrow::Cow;
 use chrono::{Local, Datelike};
+use rayon::prelude::*;
 
 use crate::constants::*;
 use crate::metrics::Metrics;
@@ -14,11 +16,17 @@ use crate::metrics::Metrics;
 // 최대 최근 응답 시간 저장 개수
 const MAX_RECENT_RESPONSES: usize = 1000;
 
+// 로그 배치 크기 및 플러시 간격
+const LOG_BATCH_SIZE: usize = 100;
+const LOG_FLUSH_INTERVAL_MS: u64 = 5000; // 5초마다 로그 플러시
+const LOG_CHANNEL_SIZE: usize = 10000;    // 로그 채널 크기
+
 /// 로그 메시지 타입
 #[derive(Debug)]
 pub enum LogMessage {
     RequestLog { content: String, host: String },
     RejectLog { content: String, host: String, ip: String },
+    FlushLogs,
 }
 
 /// 응답 시간 정보 구조체
@@ -96,6 +104,40 @@ impl ResponseMetrics {
     }
 }
 
+/// 로그 배치 구조체
+#[derive(Default)]
+struct LogBatch {
+    entries: Vec<String>,
+    size: usize,
+}
+
+impl LogBatch {
+    fn new() -> Self {
+        Self {
+            entries: Vec::with_capacity(LOG_BATCH_SIZE),
+            size: 0,
+        }
+    }
+    
+    fn add(&mut self, entry: String) {
+        self.size += entry.len();
+        self.entries.push(entry);
+    }
+    
+    fn should_flush(&self) -> bool {
+        self.entries.len() >= LOG_BATCH_SIZE || self.size >= BUFFER_SIZE_MEDIUM
+    }
+    
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+    
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.size = 0;
+    }
+}
+
 /// TLS 요청 로깅을 담당하는 구조체
 pub struct RequestLogger {
     metrics: Arc<RwLock<ResponseMetrics>>,
@@ -133,14 +175,24 @@ impl RequestLogger {
         // 로그 디렉터리 생성
         tokio::fs::create_dir_all("logs").await?;
         
-        // 채널 생성
-        let (tx, rx) = mpsc::channel::<LogMessage>(1000);
-        self.log_sender = Some(tx);
+        // 채널 생성 - 크기 증가
+        let (tx, rx) = mpsc::channel::<LogMessage>(LOG_CHANNEL_SIZE);
+        self.log_sender = Some(tx.clone());
         
         // 로그 작성 태스크 시작
         tokio::spawn(Self::log_writer_task(rx));
         
-        info!("RequestLogger initialized with async logging");
+        // 주기적 로그 플러시 태스크 시작
+        tokio::spawn(async move {
+            loop {
+                sleep(TokioDuration::from_millis(LOG_FLUSH_INTERVAL_MS)).await;
+                if tx.send(LogMessage::FlushLogs).await.is_err() {
+                    break;
+                }
+            }
+        });
+        
+        info!("RequestLogger initialized with async logging and batching");
         Ok(())
     }
     
@@ -148,36 +200,19 @@ impl RequestLogger {
     async fn log_writer_task(mut rx: Receiver<LogMessage>) {
         let mut file_cache: HashMap<String, File> = HashMap::new();
         
+        // 로그 배치 맵
+        let mut log_batches: HashMap<String, LogBatch> = HashMap::new();
+        
         while let Some(message) = rx.recv().await {
             match message {
                 LogMessage::RequestLog { content, host } => {
-                    // 호스트에 해당하는 파일이 없으면 생성
-                    if !file_cache.contains_key(&host) {
-                        let today = Local::now();
-                        let date_str = format!("{:04}{:02}{:02}", 
-                            today.year(), today.month(), today.day());
-                        let log_path = format!("logs/request_{}_{}.log", host, date_str);
-                        
-                        match tokio::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(&log_path)
-                            .await {
-                                Ok(file) => {
-                                    file_cache.insert(host.clone(), file);
-                                },
-                                Err(e) => {
-                                    error!("Failed to open log file for {}: {}", host, e);
-                                    continue;
-                                }
-                            }
-                    }
+                    // 배치에 추가
+                    let batch = log_batches.entry(host.clone()).or_insert_with(LogBatch::new);
+                    batch.add(format!("{}\n\n", content));
                     
-                    // 파일에 로그 작성
-                    if let Some(file) = file_cache.get_mut(&host) {
-                        if let Err(e) = file.write_all(content.as_bytes()).await {
-                            error!("Failed to write to log file: {}", e);
-                        }
+                    // 배치가 충분히 크면 플러시
+                    if batch.should_flush() {
+                        Self::flush_log_batch(&mut file_cache, &host, batch).await;
                     }
                 },
                 LogMessage::RejectLog { content, host, ip } => {
@@ -187,36 +222,89 @@ impl RequestLogger {
                         today.year(), today.month(), today.day());
                     let log_key = format!("{}_{}_reject", host, date_str);
                     
-                    if !file_cache.contains_key(&log_key) {
-                        let log_path = format!("logs/request_{}_reject.log", host);
-                        
-                        match tokio::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(&log_path)
-                            .await {
-                                Ok(file) => {
-                                    file_cache.insert(log_key.clone(), file);
-                                },
-                                Err(e) => {
-                                    error!("Failed to open reject log file for {}: {}", host, e);
-                                    continue;
-                                }
-                            }
-                    }
-                    
                     // IP 정보와 함께 로그 작성
                     let log_content = format!("# IP: {}\n{}\n\n", ip, content);
                     
-                    // 파일에 로그 작성
-                    if let Some(file) = file_cache.get_mut(&log_key) {
-                        if let Err(e) = file.write_all(log_content.as_bytes()).await {
-                            error!("Failed to write to reject log file: {}", e);
+                    // 배치에 추가
+                    let batch = log_batches.entry(log_key.clone()).or_insert_with(LogBatch::new);
+                    batch.add(log_content);
+                    
+                    // 배치가 충분히 크면 플러시
+                    if batch.should_flush() {
+                        Self::flush_log_batch(&mut file_cache, &log_key, batch).await;
+                    }
+                },
+                LogMessage::FlushLogs => {
+                    // 모든 배치 플러시
+                    for (host, batch) in log_batches.iter_mut() {
+                        if !batch.is_empty() {
+                            Self::flush_log_batch(&mut file_cache, host, batch).await;
                         }
                     }
                 }
             }
         }
+        
+        // 채널이 닫히면 남은 배치 모두 플러시
+        for (host, batch) in log_batches.iter_mut() {
+            if !batch.is_empty() {
+                Self::flush_log_batch(&mut file_cache, host, batch).await;
+            }
+        }
+    }
+    
+    /// 로그 배치 플러시
+    async fn flush_log_batch(file_cache: &mut HashMap<String, File>, host: &str, batch: &mut LogBatch) {
+        if batch.is_empty() {
+            return;
+        }
+        
+        // 파일이 없으면 생성
+        if !file_cache.contains_key(host) {
+            let is_reject = host.contains("_reject");
+            let log_path = if is_reject {
+                format!("logs/request_{}.log", host.split('_').next().unwrap_or(host))
+            } else {
+                let today = Local::now();
+                let date_str = format!("{:04}{:02}{:02}", today.year(), today.month(), today.day());
+                format!("logs/request_{}_{}.log", host, date_str)
+            };
+            
+            match tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .await {
+                    Ok(file) => {
+                        file_cache.insert(host.to_string(), file);
+                    },
+                    Err(e) => {
+                        error!("Failed to open log file for {}: {}", host, e);
+                        batch.clear();
+                        return;
+                    }
+                }
+        }
+        
+        // 배치 내용을 병렬로 결합
+        let combined_content = batch.entries.par_iter()
+            .fold(String::new, |mut acc, entry| {
+                acc.push_str(entry);
+                acc
+            })
+            .reduce(String::new, |mut acc, partial| {
+                acc.push_str(&partial);
+                acc
+            });
+        
+        // 파일에 로그 작성
+        if let Some(file) = file_cache.get_mut(host) {
+            if let Err(e) = file.write_all(combined_content.as_bytes()).await {
+                error!("Failed to write to log file: {}", e);
+            }
+        }
+        
+        batch.clear();
     }
     
     /// 새로운 로그 파일 생성
@@ -227,7 +315,10 @@ impl RequestLogger {
             return None;
         }
         
-        let request_log_path = format!("logs/request_{}.log", host);
+        let today = Local::now();
+        let date_str = format!("{:04}{:02}{:02}", today.year(), today.month(), today.day());
+        let request_log_path = format!("logs/request_{}_{}.log", host, date_str);
+        
         match tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -405,17 +496,18 @@ impl RequestLogger {
         // 첫 번째 줄은 요청 라인
         let request_line = lines[0].to_string();
         
-        // 필요한 헤더 추출
+        // 필요한 헤더 추출 - 병렬 처리로 개선
         let headers = lines[1..]
-            .iter()
+            .par_iter()
             .filter(|line| {
-                line.to_lowercase().starts_with("host:") ||
-                line.to_lowercase().starts_with("user-agent:") ||
-                line.to_lowercase().starts_with("referer:") ||
-                line.to_lowercase().starts_with("sec-ch-ua-platform:") ||
+                let lower = line.to_lowercase();
+                lower.starts_with("host:") ||
+                lower.starts_with("user-agent:") ||
+                lower.starts_with("referer:") ||
+                lower.starts_with("sec-ch-ua-platform:") ||
                 (request_line.starts_with("POST ") && (
-                    line.to_lowercase().starts_with("content-length:") ||
-                    line.to_lowercase().starts_with("content-type:")
+                    lower.starts_with("content-length:") ||
+                    lower.starts_with("content-type:")
                 ))
             })
             .map(|s| s.to_string())
@@ -473,25 +565,35 @@ impl RequestLogger {
         body: Option<String>,
         duration_ms: Option<u64>,
     ) -> String {
-        let mut content = String::new();
+        // 용량 예상해서 미리 할당
+        let mut content = String::with_capacity(
+            request_line.len() + 
+            headers.iter().map(|h| h.len() + 1).sum::<usize>() + 
+            body.as_ref().map_or(0, |b| b.len() + 2) +
+            duration_ms.map_or(0, |_| 30)
+        );
         
         // 요청 라인 추가
-        content.push_str(&format!("{}\n", request_line));
+        content.push_str(&request_line);
+        content.push('\n');
         
         // 헤더 추가
         for header in headers {
-            content.push_str(&format!("{}\n", header));
+            content.push_str(&header);
+            content.push('\n');
         }
         
         // 본문 추가 (있는 경우)
         if let Some(body_text) = body {
-            content.push_str("\n"); // 헤더와 본문 사이 빈 줄
+            content.push('\n'); // 헤더와 본문 사이 빈 줄
             content.push_str(&body_text);
         }
         
         // 응답 시간 추가 (있는 경우)
         if let Some(time) = duration_ms {
-            content.push_str(&format!("\nResponse-Time: {} ms\n", time));
+            content.push_str("\nResponse-Time: ");
+            content.push_str(&time.to_string());
+            content.push_str(" ms\n");
         }
         
         content
@@ -505,7 +607,7 @@ impl RequestLogger {
             }
         } else {
             // 비동기 로깅 시도
-            if let Err(e) = self.log_async(format!("{}\n\n", log_content), host) {
+            if let Err(e) = self.log_async(log_content, host) {
                 error!("[Session:{}] Failed to log asynchronously: {}", session_id, e);
             }
         }
@@ -521,14 +623,22 @@ impl RequestLogger {
             // 요청 라인 (첫 번째 줄)
             log_content.push_str(&format!("{} [BLOCKED]\n", lines[0]));
             
-            // 필요한 헤더 추출
-            for line in &lines[1..] {
-                if line.to_lowercase().starts_with("host:") ||
-                   line.to_lowercase().starts_with("user-agent:") ||
-                   line.to_lowercase().starts_with("referer:") ||
-                   line.to_lowercase().starts_with("sec-ch-ua-platform:") {
-                    log_content.push_str(&format!("{}\n", line));
-                }
+            // 필요한 헤더 추출 - 병렬 처리로 개선
+            let filtered_headers: Vec<String> = lines[1..]
+                .par_iter()
+                .filter(|line| {
+                    let lower = line.to_lowercase();
+                    lower.starts_with("host:") ||
+                    lower.starts_with("user-agent:") ||
+                    lower.starts_with("referer:") ||
+                    lower.starts_with("sec-ch-ua-platform:")
+                })
+                .map(|&s| format!("{}\n", s))
+                .collect();
+                
+            // 헤더 추가
+            for header in filtered_headers {
+                log_content.push_str(&header);
             }
             
             // 비동기 로깅 시도
