@@ -209,7 +209,8 @@ pub async fn proxy_tls_streams(
                                             &client_ip, // 클라이언트 IP 추가
                                             &server_ip, // 서버 IP 추가
                                             None,
-                                            false
+                                            false,
+                                            true // TLS 요청임을 표시
                                         ) {
                                             Ok(_) => debug!("[Session:{}] HTTPS 요청 로깅 성공", session_id),
                                             Err(e) => warn!("[Session:{}] HTTPS 요청 로깅 실패: {}", session_id, e)

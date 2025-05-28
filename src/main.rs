@@ -168,7 +168,6 @@ async fn setup_database() -> Result<(), Box<dyn Error>> {
     if let Err(e) = db::pool::initialize_pool().await {
         error!("데이터베이스 연결 풀 초기화 실패: {}", e);
         warn!("데이터베이스 연결 없이 계속 진행합니다. 로그가 저장되지 않을 수 있습니다.");
-        // 데이터베이스 연결 실패 시에도 계속 진행
         return Ok(());
     }
     

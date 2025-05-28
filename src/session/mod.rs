@@ -309,8 +309,8 @@ impl Session {
                 error!("[Session:{}] Failed to send HTTP block page: {}", self.session_id(), e);
             }
             
-            // 로그 저장 - 차단된 요청
-            self.log_blocked_request(host, request_str, &client_ip).await;
+            // 로그 저장 - 차단된 HTTP 요청
+            self.log_blocked_request(host, request_str, &client_ip, false).await;
             
         } else {
             // HTTPS 차단 페이지 전송
@@ -324,6 +324,9 @@ impl Session {
                 error!("[Session:{}] Failed to handle HTTPS block: {}", self.session_id(), e);
             }
             
+            // 로그 저장 - 차단된 HTTPS 요청
+            self.log_blocked_request(host, request_str, &client_ip, true).await;
+            
             // 연결 종료 시 활성 연결 카운트 감소
             self.metrics.connection_closed(true);
         }
@@ -336,7 +339,7 @@ impl Session {
     }
     
     /// 차단된 요청 로깅
-    async fn log_blocked_request(&self, host: &str, request_str: &str, client_ip: &str) {
+    async fn log_blocked_request(&self, host: &str, request_str: &str, client_ip: &str, is_tls: bool) {
         if let Ok(logger) = REQUEST_LOGGER.try_read() {
             // 요청 파싱
             let mut method = "UNKNOWN".to_string();
@@ -377,7 +380,8 @@ impl Session {
                 client_ip,
                 "Blocked", // 차단된 요청은 타겟 IP를 "Blocked"로 표시
                 None, // 응답 시간 없음
-                true  // 차단된 요청
+                true,  // 차단된 요청
+                is_tls  // TLS 여부
             ) {
                 debug!("[Session:{}] 차단된 요청 로깅 실패: {}", self.session_id(), e);
             }
@@ -529,7 +533,8 @@ impl Session {
                 &client_ip,
                 target_ip,
                 None,  // 응답 시간은 아직 알 수 없음
-                false   // 차단되지 않은 요청
+                false,   // 차단되지 않은 요청
+                false    // TLS 아님
             ) {
                 Ok(_) => debug!("[Session:{}] HTTP 요청 로깅 성공", self.session_id()),
                 Err(e) => debug!("[Session:{}] HTTP 요청 로깅 실패: {}", self.session_id(), e)

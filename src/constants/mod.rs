@@ -30,3 +30,11 @@ pub const ACL_CACHE_SIZE: usize = 10000;         // ACL 결과 캐시 크기
 pub const CA_CERT_FILE: &str = "ssl/ca_cert.pem";
 pub const CA_KEY_FILE: &str = "ssl/ca_key.pem";
 pub const CA_CERT_CRT_FILE: &str = "ssl/ca_cert.crt";
+
+// 최근 응답 시간 저장 개수
+pub const MAX_RECENT_RESPONSES: usize = 1000;
+
+// 로그 배치 크기 및 플러시 간격
+pub const LOG_BATCH_SIZE: usize = 1000;
+pub const LOG_FLUSH_INTERVAL_MS: u64 = 200; // 0.2초마다 로그 플러시
+pub const LOG_CHANNEL_SIZE: usize = 10000;    // 로그 채널 크기

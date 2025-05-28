@@ -41,6 +41,7 @@ impl Config {
     fn default_blocked_domains() -> HashSet<String> {
         let mut domains = HashSet::new();
         domains.insert("nexon.com".to_string());
+        // domains.insert("dongbangsystem.com".to_string());
         domains
     }
 
@@ -48,6 +49,7 @@ impl Config {
     fn default_blocked_patterns() -> HashSet<String> {
         let mut patterns = HashSet::new();
         patterns.insert("*.nexon.com".to_string());
+        // patterns.insert("*.dongbangsystem.com".to_string());
         patterns
     }
 

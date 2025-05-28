@@ -36,21 +36,7 @@ pub async fn proxy_http_streams(
         .map(|addr| addr.ip().to_string())
         .unwrap_or_else(|_| "Unknown IP".to_string());
     
-    // Linux에서만 splice 사용 시도
-    #[cfg(target_os = "linux")]
-    if USE_SPLICE {
-        debug!("[Session:{}] Attempting to use kernel splice for HTTP streams", session_id);
-        match proxy_http_streams_splice(client_stream, server_stream, Arc::clone(&metrics), session_id, request_start_time, client_ip.clone(), server_ip.clone()).await {
-            Ok(_) => return Ok(()),
-            Err(e) => {
-                warn!("[Session:{}] Splice mode failed, falling back to standard mode: {}", session_id, e);
-                // splice 실패 시 표준 모드로 폴백
-                // 새 연결을 생성해야 함
-                return Err(e);
-            }
-        }
-    }
-
+    // HTTP는 항상 표준 터널링 모드 사용 (splice 사용 안 함)
     debug!("[Session:{}] Using standard mode for HTTP streams", session_id);
     let (mut client_read, mut client_write) = tokio::io::split(client_stream);
     let (mut server_read, mut server_write) = tokio::io::split(server_stream);
@@ -131,7 +117,8 @@ pub async fn proxy_http_streams(
                                                     &_client_ip, // 클라이언트 IP 추가
                                                     &_server_ip, // 서버 IP 추가
                                                     None,
-                                                    false
+                                                    false,
+                                                    false // HTTP는 TLS가 아님
                                                 ) {
                                                     warn!("[Session:{}] HTTP 요청 로깅 실패: {}", session_id, e);
                                                 }

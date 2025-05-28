@@ -109,12 +109,12 @@ impl BlockPage {
     }
     
     /// 차단 요청 로깅
-    async fn log_blocked_request(&self, request_data: &str, host: &str, ip: &str, session_id: &str) {
+    async fn log_blocked_request(&self, request_data: &str, host: &str, ip: &str, session_id: &str, is_tls: bool) {
         // 간단하게 try_read()로 돌아가되, 비동기적으로 처리
         if let Ok(logger) = REQUEST_LOGGER.try_read() {
             // 요청 파싱 및 로깅
             // 여기서는 RequestLogger의 parse_request_for_reject 메서드를 사용하는 것이 적절합니다
-            logger.log_rejected_request(request_data, host, ip, session_id).await;
+            logger.log_rejected_request(request_data, host, ip, session_id, is_tls).await;
             debug!("[Session:{}] 차단된 요청 로깅 시도 완료", session_id);
         } else {
             debug!("[Session:{}] RequestLogger 읽기 락 획득 실패", session_id);
@@ -125,7 +125,7 @@ impl BlockPage {
     pub async fn send_http_block_page(&self, client_stream: &mut TcpStream, host: &str, session_id: &str, request: Option<&str>, client_ip: Option<&str>) -> Result<(), Box<dyn Error + Send + Sync>> {
         // 요청 로깅
         if let (Some(req), Some(ip)) = (request, client_ip) {
-            self.log_blocked_request(req, host, ip, session_id).await;
+            self.log_blocked_request(req, host, ip, session_id, false).await; // HTTP는 TLS 아님
         }
         
         let blocked_message = self.create_http_block_page(host);
@@ -155,7 +155,7 @@ impl BlockPage {
     pub async fn handle_https_block(&self, mut client_stream: TcpStream, host: &str, session_id: &str, request: Option<&str>, client_ip: Option<&str>) -> Result<(), Box<dyn Error + Send + Sync>> {
         // 요청 로깅
         if let (Some(req), Some(ip)) = (request, client_ip) {
-            self.log_blocked_request(req, host, ip, session_id).await;
+            self.log_blocked_request(req, host, ip, session_id, true).await; // HTTPS는 TLS임
         }
         
         // 1. 일단 CONNECT 요청을 승인하고 TLS 핸드셰이크 진행

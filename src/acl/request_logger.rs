@@ -12,13 +12,7 @@ use smallvec::SmallVec;
 use crate::constants::*;
 use crate::db;
 
-// 최대 최근 응답 시간 저장 개수
-const MAX_RECENT_RESPONSES: usize = 1000;
 
-// 로그 배치 크기 및 플러시 간격
-const LOG_BATCH_SIZE: usize = 1000;
-const LOG_FLUSH_INTERVAL_MS: u64 = 200; // 0.2초마다 로그 플러시
-const LOG_CHANNEL_SIZE: usize = 10000;    // 로그 채널 크기
 
 /// 로그 메시지 타입
 #[derive(Debug)]
@@ -34,7 +28,8 @@ pub enum LogMessage {
         client_ip: String,
         target_ip: String,
         response_time: Option<u64>,
-        is_rejected: bool
+        is_rejected: bool,
+        is_tls: bool
     },
     FlushLogs,
 }
@@ -117,7 +112,7 @@ impl ResponseMetrics {
 /// 로그 배치 구조체
 #[derive(Default)]
 struct LogBatch {
-    request_logs: Vec<(String, String, String, String, Option<String>, DateTime<Utc>, String, String, String, Option<u64>, bool)>, // host, method, path, header, body, timestamp, session_id, client_ip, target_ip, response_time, is_rejected
+    request_logs: Vec<(String, String, String, String, Option<String>, DateTime<Utc>, String, String, String, Option<u64>, bool, bool)>, // host, method, path, header, body, timestamp, session_id, client_ip, target_ip, response_time, is_rejected, is_tls
     size: usize,
 }
 
@@ -129,11 +124,11 @@ impl LogBatch {
         }
     }
     
-    fn add_request(&mut self, host: String, method: String, path: String, header: String, body: Option<String>, timestamp: DateTime<Utc>, session_id: String, client_ip: String, target_ip: String, response_time: Option<u64>, is_rejected: bool) {
+    fn add_request(&mut self, host: String, method: String, path: String, header: String, body: Option<String>, timestamp: DateTime<Utc>, session_id: String, client_ip: String, target_ip: String, response_time: Option<u64>, is_rejected: bool, is_tls: bool) {
         // 크기 계산 (헤더와 바디 크기 합산)
         let content_size = header.len() + body.as_ref().map_or(0, |b| b.len());
         self.size += content_size;
-        self.request_logs.push((host, method, path, header, body, timestamp, session_id, client_ip, target_ip, response_time, is_rejected));
+        self.request_logs.push((host, method, path, header, body, timestamp, session_id, client_ip, target_ip, response_time, is_rejected, is_tls));
     }
     
     fn should_flush(&self) -> bool {
@@ -151,18 +146,18 @@ impl LogBatch {
 
     // 배치 쿼리 생성 메서드
     fn create_batch_query(&self) -> (String, Vec<Box<dyn tokio_postgres::types::ToSql + Send + Sync + 'static>>) {
-        let mut query = "INSERT INTO request_logs (host, method, path, header, body, timestamp, session_id, client_ip, target_ip, response_time, is_rejected) VALUES ".to_string();
+        let mut query = "INSERT INTO request_logs (host, method, path, header, body, timestamp, session_id, client_ip, target_ip, response_time, is_rejected, is_tls) VALUES ".to_string();
         let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Send + Sync + 'static>> = Vec::new();
         
-        for (i, (host, method, path, header, body, timestamp, session_id, client_ip, target_ip, response_time, is_rejected)) in self.request_logs.iter().enumerate() {
+        for (i, (host, method, path, header, body, timestamp, session_id, client_ip, target_ip, response_time, is_rejected, is_tls)) in self.request_logs.iter().enumerate() {
             if i > 0 {
                 query.push_str(", ");
             }
             
-            let start_idx = i * 11 + 1;
-            query.push_str(&format!("(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+            let start_idx = i * 12 + 1;
+            query.push_str(&format!("(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
                 start_idx, start_idx + 1, start_idx + 2, start_idx + 3, start_idx + 4,
-                start_idx + 5, start_idx + 6, start_idx + 7, start_idx + 8, start_idx + 9, start_idx + 10));
+                start_idx + 5, start_idx + 6, start_idx + 7, start_idx + 8, start_idx + 9, start_idx + 10, start_idx + 11));
             
             params.push(Box::new(host.clone()));
             params.push(Box::new(method.clone()));
@@ -182,6 +177,7 @@ impl LogBatch {
             let rt_i64 = response_time.map(|rt| rt as i64);
             params.push(Box::new(rt_i64));
             params.push(Box::new(*is_rejected));
+            params.push(Box::new(*is_tls));
         }
         
         (query, params)
@@ -189,13 +185,13 @@ impl LogBatch {
     
     // 단일 로그 항목에 대한 쿼리 생성
     fn create_single_query() -> String {
-        "INSERT INTO request_logs (host, method, path, header, body, timestamp, session_id, client_ip, target_ip, response_time, is_rejected) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)".to_string()
+        "INSERT INTO request_logs (host, method, path, header, body, timestamp, session_id, client_ip, target_ip, response_time, is_rejected, is_tls) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)".to_string()
     }
     
     // 단일 로그 항목에 대한 파라미터 생성
     fn create_single_params(&self, index: usize) -> Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> {
-        if let Some((host, method, path, header, body, timestamp, session_id, client_ip, target_ip, response_time, is_rejected)) = self.request_logs.get(index) {
-            let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::with_capacity(11);
+        if let Some((host, method, path, header, body, timestamp, session_id, client_ip, target_ip, response_time, is_rejected, is_tls)) = self.request_logs.get(index) {
+            let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::with_capacity(12);
             
             params.push(Box::new(host.clone()));
             params.push(Box::new(method.clone()));
@@ -212,6 +208,7 @@ impl LogBatch {
             params.push(Box::new(rt_i64));
             
             params.push(Box::new(*is_rejected));
+            params.push(Box::new(*is_tls));
             
             params
         } else {
@@ -302,16 +299,21 @@ impl RequestLogger {
     /// 로그 작성 태스크
     async fn log_writer_task(mut rx: Receiver<LogMessage>) {
         let mut log_batch = LogBatch::new();
+        let mut last_flush_time = Instant::now();
+        
+        // 배치 플러시 주기
+        let flush_interval = TokioDuration::from_millis(LOG_FLUSH_INTERVAL_MS);
         
         while let Some(message) = rx.recv().await {
             match message {
-                LogMessage::RequestLog { host, method, path, header, body, timestamp, session_id, client_ip, target_ip, response_time, is_rejected } => {
-                    log_batch.add_request(host, method, path, header, body, timestamp, session_id, client_ip, target_ip, response_time, is_rejected);
+                LogMessage::RequestLog { host, method, path, header, body, timestamp, session_id, client_ip, target_ip, response_time, is_rejected, is_tls } => {
+                    log_batch.add_request(host, method, path, header, body, timestamp, session_id, client_ip, target_ip, response_time, is_rejected, is_tls);
                     
                     if log_batch.should_flush() {
                         if let Err(e) = Self::flush_log_batch(&mut log_batch).await {
                             error!("로그 배치 플러시 실패: {}", e);
                         }
+                        last_flush_time = Instant::now();
                     }
                 },
                 LogMessage::FlushLogs => {
@@ -319,30 +321,40 @@ impl RequestLogger {
                         if let Err(e) = Self::flush_log_batch(&mut log_batch).await {
                             error!("로그 배치 플러시 실패: {}", e);
                         }
+                        last_flush_time = Instant::now();
                     }
                 }
             }
-        }
-        
-        // 채널이 닫혔을 때 남은 로그 플러시
-        if !log_batch.is_empty() {
-            if let Err(e) = Self::flush_log_batch(&mut log_batch).await {
-                error!("최종 로그 배치 플러시 실패: {}", e);
+            
+            // 일정 시간이 지나면 배치 플러시
+            if last_flush_time.elapsed() >= flush_interval && !log_batch.is_empty() {
+                if let Err(e) = Self::flush_log_batch(&mut log_batch).await {
+                    error!("로그 배치 플러시 실패: {}", e);
+                }
+                last_flush_time = Instant::now();
             }
         }
     }
     
     /// 로그 배치 플러시
     async fn flush_log_batch(batch: &mut LogBatch) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        
+        debug!("로그 배치 플러시 중: {} 항목", batch.request_logs.len());
+        
+        // 쿼리 실행기 가져오기
         let executor = match db::query::QueryExecutor::get_instance().await {
             Ok(executor) => executor,
             Err(e) => {
-                warn!("로그 저장을 위한 쿼리 실행기 가져오기 실패: {}", e);
-                // 로그 배치 삭제하고 계속 진행
-                batch.clear();
-                return Ok(());
+                error!("쿼리 실행기 가져오기 실패: {}", e);
+                return Err(e.into());
             }
         };
+        
+        // 배치 처리 시도
+        let (query, params) = batch.create_batch_query();
         
         // 요청 로그 플러시
         if !batch.request_logs.is_empty() {
@@ -388,7 +400,7 @@ impl RequestLogger {
                                     // 날짜 파티션이 존재하지 않는 경우 파티션 생성 시도
                                     error!("파티션 관련 오류 발생: {}", error_msg);
                                     
-                                    if let Some((_, _, _, _, _, timestamp, _, _, _, _, _)) = batch.request_logs.get(i) {
+                                    if let Some((host, method, path, header, body, timestamp, session_id, client_ip, target_ip, response_time, is_rejected, is_tls)) = batch.request_logs.get(i) {
                                         // 타임스탬프 파티션을 위한 날짜 추출
                                         let date = timestamp.date_naive();
                                         let next_date = date + chrono::Duration::days(1);
@@ -468,7 +480,8 @@ impl RequestLogger {
         client_ip: impl Into<Cow<'a, str>>,
         target_ip: impl Into<Cow<'a, str>>,
         response_time: Option<u64>,
-        is_rejected: bool
+        is_rejected: bool,
+        is_tls: bool
     ) -> Result<(), &'static str> {
         let host_str = host.into().to_string();
         let method_str = method.into().to_string();
@@ -494,7 +507,8 @@ impl RequestLogger {
                     client_ip: client_ip_str,
                     target_ip: target_ip_str,
                     response_time,
-                    is_rejected
+                    is_rejected,
+                    is_tls
                 }).is_err() {
                     warn!("[Session:{}] 로그 채널이 가득 찼습니다", session_id_clone);
                     return Err("로그 채널이 가득 찼습니다");
@@ -510,7 +524,7 @@ impl RequestLogger {
     }
     
     /// 차단된 요청 로깅
-    pub async fn log_rejected_request(&self, request: &str, host: &str, ip: &str, session_id: &str) {
+    pub async fn log_rejected_request(&self, request: &str, host: &str, ip: &str, session_id: &str, is_tls: bool) {
         let (method, path, header, body) = self.parse_request_for_reject(request);
         
         if let Some(sender) = &self.log_sender {
@@ -525,7 +539,8 @@ impl RequestLogger {
                 session_id: session_id.to_string(),
                 target_ip: "Blocked".to_string(), // 차단된 요청은 타겟 IP를 "Blocked"로 표시
                 response_time: None,
-                is_rejected: true
+                is_rejected: true,
+                is_tls // 차단된 요청의 TLS 여부
             };
             
             if let Err(e) = sender.send(log_message).await {
@@ -640,50 +655,56 @@ impl RequestLogger {
             }
         };
         
-        // 요청 로그 테이블 생성
-        let request_logs_query = "
-            CREATE TABLE IF NOT EXISTS request_logs (
-                id SERIAL,
-                host TEXT NOT NULL,
-                method TEXT NOT NULL,
-                path TEXT NOT NULL,
-                header TEXT NOT NULL,
-                body TEXT,
-                timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                session_id TEXT NOT NULL,
-                client_ip TEXT NOT NULL,
-                target_ip TEXT NOT NULL,
-                response_time BIGINT,
-                is_rejected BOOLEAN NOT NULL DEFAULT FALSE
-            ) PARTITION BY RANGE (timestamp)";
+        // 요청 로그 테이블 존재 여부 확인
+        let check_table_query = "
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_schema = 'public' 
+                AND table_name = 'request_logs'
+            );
+        ";
         
-        if let Err(e) = executor.execute_query(request_logs_query, &[]).await {
-            error!("request_logs 테이블 생성 실패: {}", e);
-            return Err(e);
-        }
+        let table_exists = match executor.query_one(check_table_query, &[], |row| Ok(row.get::<_, bool>(0))).await {
+            Ok(exists) => exists,
+            Err(e) => {
+                error!("테이블 존재 여부 확인 실패: {}", e);
+                false
+            }
+        };
         
-        // 오늘 날짜에 대한 파티션 생성 시도
-        let today = chrono::Local::now().date_naive();
-        let tomorrow = today + chrono::Duration::days(1);
+        if !table_exists {
+            // 테이블이 존재하지 않으면 새로 생성
+            debug!("request_logs 테이블이 존재하지 않습니다. 새로 생성합니다.");
+            
+            // 요청 로그 테이블 생성
+            let request_logs_query = "
+                CREATE TABLE IF NOT EXISTS request_logs (
+                    id SERIAL,
+                    host TEXT NOT NULL,
+                    method TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    header TEXT NOT NULL,
+                    body TEXT,
+                    timestamp TIMESTAMPTZ NOT NULL,
+                    session_id TEXT NOT NULL,
+                    client_ip TEXT NOT NULL,
+                    target_ip TEXT NOT NULL,
+                    response_time BIGINT,
+                    is_rejected BOOLEAN NOT NULL DEFAULT FALSE,
+                    is_tls BOOLEAN NOT NULL DEFAULT FALSE,
+                    PRIMARY KEY (id, timestamp)
+                ) PARTITION BY RANGE (timestamp);
+            ";
+            
+            // 테이블 생성 실행
+            if let Err(e) = executor.execute_query(request_logs_query, &[]).await {
+                error!("request_logs 테이블 생성 실패: {}", e);
+                return Err(e.into());
+            }
+            
+            info!("request_logs 테이블이 성공적으로 생성되었습니다.");
+        } 
         
-        // request_logs 파티션 생성
-        let req_partition_name = format!("request_logs_{:04}{:02}{:02}", 
-            today.year(), today.month(), today.day());
-        
-        let req_partition_query = format!(
-            "CREATE TABLE IF NOT EXISTS {} PARTITION OF request_logs 
-             FOR VALUES FROM ('{}') TO ('{}')",
-            req_partition_name, today, tomorrow
-        );
-        
-        if let Err(e) = executor.execute_query(&req_partition_query, &[]).await {
-            warn!("request_logs 파티션 생성 실패: {}", e);
-            // 파티션 생성 실패해도 진행
-        } else {
-            debug!("request_logs 파티션 생성 완료: {}", req_partition_name);
-        }
-        
-        debug!("기본 로깅 테이블 및 파티션 확인 완료");
         Ok(())
     }
 } 

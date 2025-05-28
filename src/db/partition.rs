@@ -56,7 +56,8 @@ impl PartitionManager {
                 client_ip TEXT NOT NULL,
                 target_ip TEXT NOT NULL,
                 response_time BIGINT,
-                is_rejected BOOLEAN NOT NULL DEFAULT FALSE
+                is_rejected BOOLEAN NOT NULL DEFAULT FALSE,
+                is_tls BOOLEAN NOT NULL DEFAULT FALSE,
             ) PARTITION BY RANGE (timestamp)".to_string();
         
         client.execute(&request_logs_query, &[]).await?;
@@ -65,8 +66,8 @@ impl PartitionManager {
         let indices = [
             "CREATE INDEX IF NOT EXISTS request_logs_host_idx ON request_logs(host)",
             "CREATE INDEX IF NOT EXISTS request_logs_timestamp_idx ON request_logs(timestamp)",
-            "CREATE INDEX IF NOT EXISTS request_logs_client_ip_idx ON request_logs(client_ip)",
-            "CREATE INDEX IF NOT EXISTS request_logs_is_rejected_idx ON request_logs(is_rejected)"
+            "CREATE INDEX IF NOT EXISTS request_logs_is_rejected_idx ON request_logs(is_rejected)",
+            "CREATE INDEX IF NOT EXISTS request_logs_is_tls_idx ON request_logs(is_tls)"
         ];
         
         for index_query in indices {
