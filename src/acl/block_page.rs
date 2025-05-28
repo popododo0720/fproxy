@@ -110,7 +110,7 @@ impl BlockPage {
     
     /// 차단 요청 로깅
     async fn log_blocked_request(&self, request_data: &str, host: &str, ip: &str, session_id: &str) {
-        if let Ok(logger) = REQUEST_LOGGER.try_lock() {
+        if let Ok(logger) = REQUEST_LOGGER.try_read() {
             let log_content = format!("{} [BLOCKED]\n", request_data);
             logger.log_rejected_request(log_content.as_str(), host, ip, session_id).await;
         } else {

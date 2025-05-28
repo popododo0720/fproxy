@@ -3,8 +3,9 @@ use tokio::io::AsyncWriteExt;
 use tokio::fs::File;
 use tokio::sync::mpsc::{self, Sender, Receiver};
 use std::collections::{VecDeque, HashMap};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
+use std::borrow::Cow;
 use chrono::{Local, Datelike};
 
 use crate::constants::*;
@@ -93,72 +94,35 @@ impl ResponseMetrics {
             }
         }
     }
-    
-    // /// 전체 평균 응답 시간 계산
-    // pub fn get_average_response_time(&self) -> Option<f64> {
-    //     if self.total_responses > 0 {
-    //         Some(self.total_duration_ms as f64 / self.total_responses as f64)
-    //     } else {
-    //         None
-    //     }
-    // }
-    
-    // /// 최근 1분 평균 응답 시간 계산
-    // pub fn get_recent_average_response_time(&self) -> Option<f64> {
-    //     if !self.recent_responses.is_empty() {
-    //         let total: u64 = self.recent_responses.iter()
-    //             .map(|info| info.duration_ms)
-    //             .sum();
-    //         Some(total as f64 / self.recent_responses.len() as f64)
-    //     } else {
-    //         None
-    //     }
-    // }
-    
-    // /// 현재 통계 반환
-    // pub fn get_stats(&self) -> (usize, Option<f64>, Option<f64>, u64, u64) {
-    //     (
-    //         self.total_responses,
-    //         self.get_average_response_time(),
-    //         self.get_recent_average_response_time(),
-    //         self.min_duration_ms,
-    //         self.max_duration_ms
-    //     )
-    // }
-    
-    // /// 응답 시간 통계 출력
-    // pub fn print_stats(&self) {
-    //     info!("=== Response Time Statistics ===");
-    //     info!("Total responses: {}", self.total_responses);
-        
-    //     if self.total_responses > 0 {
-    //         info!("Overall average response time: {:.2} ms", 
-    //              self.get_average_response_time().unwrap_or(0.0));
-    //         info!("Min response time: {} ms", self.min_duration_ms);
-    //         info!("Max response time: {} ms", self.max_duration_ms);
-    //     }
-        
-    //     if let Some(recent_avg) = self.get_recent_average_response_time() {
-    //         info!("Recent (1 min) average response time: {:.2} ms", recent_avg);
-    //         info!("Recent responses count: {}", self.recent_responses.len());
-    //     }
-    // }
 }
 
 /// TLS 요청 로깅을 담당하는 구조체
 pub struct RequestLogger {
-    metrics: Arc<Mutex<ResponseMetrics>>,
-    request_start_times: Arc<Mutex<HashMap<String, Instant>>>,
+    metrics: Arc<RwLock<ResponseMetrics>>,
+    request_start_times: Arc<RwLock<HashMap<String, Instant>>>,
     log_sender: Option<Sender<LogMessage>>,
     global_metrics: Arc<Metrics>,
+}
+
+/// HTTP 요청 파싱 결과
+#[derive(Debug)]
+enum ParseResult {
+    Complete {
+        request_line: String,
+        headers: Vec<String>,
+        body: Option<String>,
+        duration_ms: Option<u64>,
+    },
+    Incomplete,
+    Invalid,
 }
 
 impl RequestLogger {
     /// 새 RequestLogger 인스턴스 생성
     pub fn new() -> Self {
         RequestLogger {
-            metrics: Arc::new(Mutex::new(ResponseMetrics::new())),
-            request_start_times: Arc::new(Mutex::new(HashMap::new())),
+            metrics: Arc::new(RwLock::new(ResponseMetrics::new())),
+            request_start_times: Arc::new(RwLock::new(HashMap::new())),
             log_sender: None,
             global_metrics: Metrics::new(),
         }
@@ -279,20 +243,20 @@ impl RequestLogger {
 
     /// 요청 시작 시간 기록
     pub fn record_request_start(&self, request_id: &str) {
-        if let Ok(mut start_times) = self.request_start_times.lock() {
+        if let Ok(mut start_times) = self.request_start_times.write() {
             start_times.insert(request_id.to_string(), Instant::now());
         }
     }
     
     /// 응답 완료 시간 기록 및 메트릭 업데이트
     pub fn record_request_end(&self, request_id: &str) -> Option<u64> {
-        if let Ok(mut start_times) = self.request_start_times.lock() {
+        if let Ok(mut start_times) = self.request_start_times.write() {
             if let Some(start_time) = start_times.remove(request_id) {
                 let duration = start_time.elapsed();
                 let duration_ms = duration.as_millis() as u64;
                 
                 // 로컬 메트릭 업데이트
-                if let Ok(mut metrics) = self.metrics.lock() {
+                if let Ok(mut metrics) = self.metrics.write() {
                     metrics.add_response_time(duration_ms);
                     
                     // 전역 메트릭스 업데이트
@@ -307,9 +271,12 @@ impl RequestLogger {
     }
     
     /// 비동기로 로그 작성
-    pub fn log_async(&self, content: String, host: String) -> Result<(), &'static str> {
+    pub fn log_async<'a>(&self, content: impl Into<Cow<'a, str>>, host: impl Into<Cow<'a, str>>) -> Result<(), &'static str> {
         if let Some(sender) = &self.log_sender {
-            let message = LogMessage::RequestLog { content, host };
+            let message = LogMessage::RequestLog { 
+                content: content.into().into_owned(), 
+                host: host.into().into_owned() 
+            };
             if sender.try_send(message).is_err() {
                 return Err("로그 채널이 가득 찼습니다");
             }
@@ -320,9 +287,18 @@ impl RequestLogger {
     }
     
     /// 비동기로 차단 로그 작성
-    pub fn log_reject_async(&self, content: String, host: String, ip: String) -> Result<(), &'static str> {
+    pub fn log_reject_async<'a>(
+        &self, 
+        content: impl Into<Cow<'a, str>>, 
+        host: impl Into<Cow<'a, str>>, 
+        ip: impl Into<Cow<'a, str>>
+    ) -> Result<(), &'static str> {
         if let Some(sender) = &self.log_sender {
-            let message = LogMessage::RejectLog { content, host, ip };
+            let message = LogMessage::RejectLog { 
+                content: content.into().into_owned(), 
+                host: host.into().into_owned(), 
+                ip: ip.into().into_owned() 
+            };
             if sender.try_send(message).is_err() {
                 return Err("로그 채널이 가득 찼습니다");
             }
@@ -346,132 +322,192 @@ impl RequestLogger {
         // 데이터를 누적 버퍼에 추가
         accumulated_data.extend_from_slice(data);
         
-        // 데이터를 문자열로 변환 시도
-        if let Ok(data_str) = std::str::from_utf8(accumulated_data) {
-            // HTTP 요청 시작 감지
-            if !*processing_request && 
-               (data_str.starts_with("GET ") || data_str.starts_with("POST ") || 
-                data_str.starts_with("PUT ") || data_str.starts_with("DELETE ") || 
-                data_str.starts_with("HEAD ") || data_str.starts_with("OPTIONS ")) {
-                *processing_request = true;
-                // 요청 시작 시간 기록
-                self.record_request_start(request_id);
+        // 버퍼가 너무 커지면 초기화 (메모리 누수 방지)
+        if accumulated_data.len() > BUFFER_SIZE_LARGE {
+            debug!("[Session:{}] Accumulated buffer too large, clearing", session_id);
+            accumulated_data.clear();
+            *processing_request = false;
+            return;
+        }
+        
+        // 데이터를 문자열로 변환
+        let data_str = match std::str::from_utf8(accumulated_data) {
+            Ok(s) => Cow::Borrowed(s),
+            Err(_) => {
+                debug!("[Session:{}] Invalid UTF-8 data in request", session_id);
+                return;
             }
-            
-            // HTTP 요청 처리
-            if *processing_request {
-                // 헤더와 본문 분리 시도
-                if data_str.contains("\r\n\r\n") {
-                    let parts: Vec<&str> = data_str.split("\r\n\r\n").collect();
-                    let headers = parts[0];
+        };
+        
+        // 새 HTTP 요청 시작 감지
+        let should_start_processing = !*processing_request && self.is_http_request_start(&data_str);
+        
+        if should_start_processing {
+            *processing_request = true;
+            self.record_request_start(request_id);
+            debug!("[Session:{}] 새 HTTP 요청 감지: {}", 
+                   session_id, data_str.lines().next().unwrap_or(""));
+        }
+        
+        // HTTP 요청 처리
+        if *processing_request {
+            match self.parse_http_request(&data_str, request_id) {
+                ParseResult::Complete { request_line, headers, body, duration_ms } => {
+                    // 로그 내용 구성
+                    let log_content = self.format_log_content(request_line, headers, body, duration_ms);
                     
-                    // 헤더 라인 분리
-                    let header_lines: Vec<&str> = headers.lines().collect();
+                    // 로그 기록
+                    self.write_log(log_content, file, host, session_id).await;
                     
-                    // 요청 라인 (첫 번째 줄)
-                    let mut log_content = format!("{}\n", header_lines[0]);
-                    
-                    // Content-Length 값 추출
-                    let mut content_length = 0;
-                    let is_post = header_lines[0].starts_with("POST ");
-                    
-                    // 필요한 헤더 추출
-                    for line in &header_lines[1..] {
-                        if line.to_lowercase().starts_with("host:") ||
-                           line.to_lowercase().starts_with("user-agent:") ||
-                           line.to_lowercase().starts_with("referer:") ||
-                           line.to_lowercase().starts_with("sec-ch-ua-platform:") {
-                            log_content.push_str(&format!("{}\n", line));
-                        }
-                        
-                        // Content-Length 값 추출
-                        if is_post && line.to_lowercase().starts_with("content-length:") {
-                            log_content.push_str(&format!("{}\n", line));
-                            if let Some(len_str) = line.split(':').nth(1) {
-                                if let Ok(len) = len_str.trim().parse::<usize>() {
-                                    content_length = len;
-                                }
-                            }
-                        }
-                        
-                        // Content-Type 헤더 추가 (POST 요청인 경우)
-                        if is_post && line.to_lowercase().starts_with("content-type:") {
-                            log_content.push_str(&format!("{}\n", line));
-                        }
-                    }
-                    
-                    // POST 요청이고 본문이 있는 경우
-                    if is_post && parts.len() > 1 {
-                        let body = parts[1];
-                        
-                        // 본문 전체를 받았는지 확인
-                        let received_body_len = body.len();
-                        
-                        // 전체 본문을 받았거나 충분한 양을 받았으면 로깅
-                        if content_length == 0 || received_body_len >= content_length || received_body_len >= 4096 {
-                            // 본문 추가 (최대 4096)
-                            let body_preview = if body.len() > 4096 {
-                                format!("{}... (truncated)", &body[0..4096])
-                            } else {
-                                body.to_string()
-                            };
-                            
-                            log_content.push_str("\n"); // 헤더와 본문 사이 빈 줄
-                            log_content.push_str(&body_preview);
-                            
-                            // 응답 시간 기록
-                            if let Some(duration_ms) = self.record_request_end(request_id) {
-                                log_content.push_str(&format!("\nResponse-Time: {} ms\n", duration_ms));
-                            }
-                            
-                            // 로그 작성 (파일이 있으면 직접, 없으면 비동기)
-                            if let Some(file) = file {
-                                if let Err(e) = file.write_all(format!("{}\n\n", log_content).as_bytes()).await {
-                                    error!("[Session:{}] Failed to write to request log file: {}", session_id, e);
-                                }
-                            } else {
-                                // 비동기 로깅 시도
-                                if let Err(e) = self.log_async(format!("{}\n\n", log_content), host.to_string()) {
-                                    error!("[Session:{}] Failed to log asynchronously: {}", session_id, e);
-                                }
-                            }
-                            
-                            // 처리 완료 후 버퍼 초기화
-                            accumulated_data.clear();
-                            *processing_request = false;
-                        }
-                    } else {
-                        // GET 요청이나 본문이 없는 요청은 바로 로깅
-                        // 응답 시간 기록
-                        if let Some(duration_ms) = self.record_request_end(request_id) {
-                            log_content.push_str(&format!("\nResponse-Time: {} ms\n", duration_ms));
-                        }
-                        
-                        // 로그 작성 (파일이 있으면 직접, 없으면 비동기)
-                        if let Some(file) = file {
-                            if let Err(e) = file.write_all(format!("{}\n\n", log_content).as_bytes()).await {
-                                error!("[Session:{}] Failed to write to request log file: {}", session_id, e);
-                            }
-                        } else {
-                            // 비동기 로깅 시도
-                            if let Err(e) = self.log_async(format!("{}\n\n", log_content), host.to_string()) {
-                                error!("[Session:{}] Failed to log asynchronously: {}", session_id, e);
-                            }
-                        }
-                        
-                        // 처리 완료 후 버퍼 초기화
-                        accumulated_data.clear();
-                        *processing_request = false;
-                    }
+                    // 처리 완료 후 상태 초기화
+                    accumulated_data.clear();
+                    *processing_request = false;
+                },
+                ParseResult::Incomplete => {
+                    // 요청이 아직 완료되지 않음, 더 많은 데이터를 기다림
+                },
+                ParseResult::Invalid => {
+                    // 유효하지 않은 요청, 버퍼 초기화
+                    debug!("[Session:{}] Invalid HTTP request format", session_id);
+                    accumulated_data.clear();
+                    *processing_request = false;
                 }
             }
         }
+    }
+    
+    /// HTTP 요청 시작인지 확인
+    fn is_http_request_start<'a>(&self, data: &'a str) -> bool {
+        data.starts_with("GET ") || 
+        data.starts_with("POST ") || 
+        data.starts_with("PUT ") || 
+        data.starts_with("DELETE ") || 
+        data.starts_with("HEAD ") || 
+        data.starts_with("OPTIONS ")
+    }
+    
+    /// HTTP 요청 파싱
+    fn parse_http_request<'a>(&self, data: &'a str, request_id: &str) -> ParseResult {
+        // 헤더와 본문 분리 시도
+        if !data.contains("\r\n\r\n") {
+            return ParseResult::Incomplete;
+        }
         
-        // 버퍼가 너무 커지면 초기화 (메모리 누수 방지)
-        if accumulated_data.len() > BUFFER_SIZE_LARGE {
-            accumulated_data.clear();
-            *processing_request = false;
-            debug!("[Session:{}] Accumulated buffer too large, clearing", session_id);
+        let parts: Vec<&str> = data.split("\r\n\r\n").collect();
+        let headers_section = parts[0];
+        
+        // 헤더 라인 분리
+        let lines: Vec<&str> = headers_section.lines().collect();
+        if lines.is_empty() {
+            return ParseResult::Invalid;
+        }
+        
+        // 첫 번째 줄은 요청 라인
+        let request_line = lines[0].to_string();
+        
+        // 필요한 헤더 추출
+        let headers = lines[1..]
+            .iter()
+            .filter(|line| {
+                line.to_lowercase().starts_with("host:") ||
+                line.to_lowercase().starts_with("user-agent:") ||
+                line.to_lowercase().starts_with("referer:") ||
+                line.to_lowercase().starts_with("sec-ch-ua-platform:") ||
+                (request_line.starts_with("POST ") && (
+                    line.to_lowercase().starts_with("content-length:") ||
+                    line.to_lowercase().starts_with("content-type:")
+                ))
+            })
+            .map(|s| s.to_string())
+            .collect::<Vec<String>>();
+        
+        // POST 요청에 대한 본문 처리
+        let body = if request_line.starts_with("POST ") && parts.len() > 1 {
+            // Content-Length 값 추출
+            let content_length = headers.iter()
+                .filter(|h| h.to_lowercase().starts_with("content-length:"))
+                .next()
+                .and_then(|h| {
+                    h.split(':')
+                     .nth(1)
+                     .and_then(|v| v.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            
+            let body = parts[1];
+            
+            // 전체 본문을 받았거나 충분한 양을 받았는지 확인
+            if content_length == 0 || body.len() >= content_length || body.len() >= 4096 {
+                // 본문 추가 (최대 4096)
+                let body_preview = if body.len() > 4096 {
+                    format!("{}... (truncated)", &body[0..4096])
+                } else {
+                    body.to_string()
+                };
+                
+                Some(body_preview)
+            } else {
+                // 아직 본문이 완전히 수신되지 않음
+                return ParseResult::Incomplete;
+            }
+        } else {
+            None
+        };
+        
+        // 응답 시간 계산
+        let duration_ms = self.record_request_end(request_id);
+        
+        ParseResult::Complete {
+            request_line,
+            headers,
+            body,
+            duration_ms,
+        }
+    }
+    
+    /// 로그 내용 형식화
+    fn format_log_content(
+        &self,
+        request_line: String,
+        headers: Vec<String>,
+        body: Option<String>,
+        duration_ms: Option<u64>,
+    ) -> String {
+        let mut content = String::new();
+        
+        // 요청 라인 추가
+        content.push_str(&format!("{}\n", request_line));
+        
+        // 헤더 추가
+        for header in headers {
+            content.push_str(&format!("{}\n", header));
+        }
+        
+        // 본문 추가 (있는 경우)
+        if let Some(body_text) = body {
+            content.push_str("\n"); // 헤더와 본문 사이 빈 줄
+            content.push_str(&body_text);
+        }
+        
+        // 응답 시간 추가 (있는 경우)
+        if let Some(time) = duration_ms {
+            content.push_str(&format!("\nResponse-Time: {} ms\n", time));
+        }
+        
+        content
+    }
+    
+    /// 로그 파일에 기록
+    async fn write_log(&self, log_content: String, file: &mut Option<File>, host: &str, session_id: &str) {
+        if let Some(file) = file {
+            if let Err(e) = file.write_all(format!("{}\n\n", log_content).as_bytes()).await {
+                error!("[Session:{}] Failed to write to request log file: {}", session_id, e);
+            }
+        } else {
+            // 비동기 로깅 시도
+            if let Err(e) = self.log_async(format!("{}\n\n", log_content), host) {
+                error!("[Session:{}] Failed to log asynchronously: {}", session_id, e);
+            }
         }
     }
     
@@ -496,11 +532,7 @@ impl RequestLogger {
             }
             
             // 비동기 로깅 시도
-            if let Err(e) = self.log_reject_async(
-                log_content, 
-                host.to_string(),
-                ip.to_string()
-            ) {
+            if let Err(e) = self.log_reject_async(log_content, host, ip) {
                 error!("[Session:{}] Failed to log rejected request: {}", session_id, e);
             }
         }

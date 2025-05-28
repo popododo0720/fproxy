@@ -32,8 +32,8 @@ static FD_LIMIT: Lazy<u64> = Lazy::new(|| {
 });
 
 // 전역 RequestLogger 인스턴스
-static REQUEST_LOGGER: Lazy<Arc<tokio::sync::Mutex<RequestLogger>>> = Lazy::new(|| {
-    Arc::new(tokio::sync::Mutex::new(RequestLogger::new()))
+static REQUEST_LOGGER: Lazy<Arc<tokio::sync::RwLock<RequestLogger>>> = Lazy::new(|| {
+    Arc::new(tokio::sync::RwLock::new(RequestLogger::new()))
 });
 
 #[tokio::main]
@@ -93,7 +93,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // RequestLogger 초기화
     {
-        let mut logger = REQUEST_LOGGER.lock().await;
+        let mut logger = REQUEST_LOGGER.write().await;
         if let Err(e) = logger.init().await {
             error!("Failed to initialize RequestLogger: {}", e);
         } else {

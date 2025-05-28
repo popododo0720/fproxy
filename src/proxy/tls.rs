@@ -1,9 +1,8 @@
 use std::error::Error;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::io;
 use std::time::Instant;
 use std::collections::HashMap;
-use std::sync::Mutex;
 
 use log::{debug, error, info, warn};
 use tokio::net::TcpStream;
@@ -37,12 +36,12 @@ pub async fn proxy_tls_streams(
     let request_logger = RequestLogger::new();
     
     // 개별 요청 시작 시간 추적을 위한 HashMap
-    let request_times = Arc::new(Mutex::new(HashMap::new()));
+    let request_times = Arc::new(RwLock::new(HashMap::new()));
     
     // HTTP 요청 감지 상태
-    let parsing_request = Arc::new(Mutex::new(false));
-    let current_request_id = Arc::new(Mutex::new(0_u64));
-    let request_buffer = Arc::new(Mutex::new(Vec::new()));
+    let parsing_request = Arc::new(RwLock::new(false));
+    let current_request_id = Arc::new(RwLock::new(0_u64));
+    let request_buffer = Arc::new(RwLock::new(Vec::new()));
     
     // 바이트 카운터 초기화
     let client_to_server = {
@@ -81,34 +80,34 @@ pub async fn proxy_tls_streams(
                         
                         // HTTP 요청 감지 및 처리
                         if let Ok(data_str) = std::str::from_utf8(data_slice) {
-                            if !*parsing_request.lock().unwrap() {
+                            if !*parsing_request.read().unwrap() {
                                 // 새로운 요청 감지 (GET, POST, PUT, DELETE 등으로 시작)
                                 if data_str.starts_with("GET ") || data_str.starts_with("POST ") || 
                                    data_str.starts_with("PUT ") || data_str.starts_with("DELETE ") || 
                                    data_str.starts_with("HEAD ") || data_str.starts_with("OPTIONS ") {
                                     
                                     // 새 요청 ID 할당 및 시작 시간 기록
-                                    let mut req_id = current_request_id.lock().unwrap();
+                                    let mut req_id = current_request_id.write().unwrap();
                                     *req_id += 1;
                                     let request_id = *req_id;
                                     
                                     // 요청 시작 시간 기록
-                                    request_times.lock().unwrap().insert(request_id, Instant::now());
-                                    *parsing_request.lock().unwrap() = true;
+                                    request_times.write().unwrap().insert(request_id, Instant::now());
+                                    *parsing_request.write().unwrap() = true;
                                     
                                     debug!("[Session:{}] 새 HTTPS 요청 #{} 감지: {}", 
                                           session_id, request_id, data_str.lines().next().unwrap_or(""));
                                     
                                     // 요청 버퍼에 데이터 저장
-                                    request_buffer.lock().unwrap().clear();
-                                    request_buffer.lock().unwrap().extend_from_slice(data_slice);
+                                    request_buffer.write().unwrap().clear();
+                                    request_buffer.write().unwrap().extend_from_slice(data_slice);
                                 }
                             } else {
                                 // 이미 요청을 처리 중인 경우 버퍼에 추가
-                                request_buffer.lock().unwrap().extend_from_slice(data_slice);
+                                request_buffer.write().unwrap().extend_from_slice(data_slice);
                                 
                                 // 요청 종료 확인 (헤더 끝 표시 "\r\n\r\n" 찾기)
-                                if let Ok(buffer_str) = std::str::from_utf8(&request_buffer.lock().unwrap()) {
+                                if let Ok(buffer_str) = std::str::from_utf8(&request_buffer.read().unwrap()) {
                                     if buffer_str.contains("\r\n\r\n") {
                                         debug!("[Session:{}] HTTPS 요청 헤더 완료", session_id);
                                     }
@@ -193,7 +192,7 @@ pub async fn proxy_tls_streams(
                                     response_buffer.extend_from_slice(data_slice);
                                     
                                     // 현재 처리 중인 요청 ID 가져오기
-                                    current_response_for = *current_request_id.lock().unwrap();
+                                    current_response_for = *current_request_id.read().unwrap();
                                     
                                     debug!("[Session:{}] HTTPS 응답 감지, 요청 #{} 처리 중", 
                                           session_id, current_response_for);
@@ -257,7 +256,7 @@ pub async fn proxy_tls_streams(
                                     // 응답이 완료된 경우
                                     if response_completed {
                                         // 응답 시간 계산
-                                        let mut times = request_times.lock().unwrap();
+                                        let mut times = request_times.write().unwrap();
                                         if let Some(start_time) = times.remove(&current_response_for) {
                                             let response_time = start_time.elapsed().as_millis() as u64;
                                             
@@ -268,7 +267,7 @@ pub async fn proxy_tls_streams(
                                                  session_id, current_response_for, response_time);
                                             
                                             // 요청 파싱 상태 초기화
-                                            *parsing_request.lock().unwrap() = false;
+                                            *parsing_request.write().unwrap() = false;
                                         } else {
                                             warn!("[Session:{}] HTTPS 요청 #{} 완료되었으나 시작 시간을 찾을 수 없음", 
                                                  session_id, current_response_for);
@@ -316,13 +315,13 @@ pub async fn proxy_tls_streams(
     };
     
     // 세션 종료 시 모든 미완료 요청에 대한 타임아웃 처리
-    let times = request_times.lock().unwrap();
+    let times = request_times.read().unwrap();
     for (req_id, start_time) in times.iter() {
         let response_time = start_time.elapsed().as_millis() as u64;
         warn!("[Session:{}] HTTPS 요청 #{} 미완료 종료, 시간: {} ms", session_id, req_id, response_time);
         
-        // 미완료 요청은 타임아웃으로 처리하되 메트릭스에는 포함하지 않음
-        // 필요한 경우 메트릭스에 별도 필드를 추가하여 미완료된 요청 수를 추적할 수 있음
+        // 미완료 요청은 메트릭스에 포함하지 않음
+        // 비정상 종료된 요청은 응답 시간 통계에 포함하지 않는 것이 정확한 모니터링에 도움됨
     }
     
     // 세션 전체 시간도 기록 (디버깅 및 모니터링용)

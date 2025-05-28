@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::fs;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use std::collections::HashMap;
 
 use log::{debug, error, info, warn};
@@ -22,8 +22,8 @@ static ROOT_CA: Lazy<Mutex<Option<Certificate>>> = Lazy::new(|| Mutex::new(None)
 
 // 도메인별 인증서 캐시
 type CertKeyPair = (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>);
-static CERT_CACHE: Lazy<Mutex<HashMap<String, CertKeyPair>>> = 
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static CERT_CACHE: Lazy<RwLock<HashMap<String, CertKeyPair>>> = 
+    Lazy::new(|| RwLock::new(HashMap::new()));
 
 /// 루트 CA 인증서를 초기화합니다
 pub fn init_root_ca() -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -89,7 +89,7 @@ pub fn init_root_ca() -> Result<(), Box<dyn Error + Send + Sync>> {
 pub async fn generate_fake_cert(host: &str) -> Result<CertKeyPair, Box<dyn Error + Send + Sync>> {
     // 캐시에서 인증서 확인
     {
-        let cache = CERT_CACHE.lock().unwrap();
+        let cache = CERT_CACHE.read().unwrap();
         if let Some(cert) = cache.get(host) {
             debug!("Using cached certificate for host: {}", host);
             
@@ -167,6 +167,29 @@ pub async fn generate_fake_cert(host: &str) -> Result<CertKeyPair, Box<dyn Error
     ];
     
     let private_key = PrivateKeyDer::Pkcs8(key_der.into());
+    
+    // 인증서를 캐시에 저장
+    let private_key_for_cache = match &private_key {
+        PrivateKeyDer::Pkcs8(key) => {
+            let key_data = key.secret_pkcs8_der().to_vec();
+            PrivateKeyDer::Pkcs8(key_data.into())
+        },
+        PrivateKeyDer::Sec1(key) => {
+            let key_data = key.secret_sec1_der().to_vec();
+            PrivateKeyDer::Sec1(key_data.into())
+        },
+        PrivateKeyDer::Pkcs1(key) => {
+            let key_data = key.secret_pkcs1_der().to_vec();
+            PrivateKeyDer::Pkcs1(key_data.into())
+        },
+        _ => return Err("Unsupported private key format".into()),
+    };
+    
+    let cert_key_pair = (cert_chain.clone(), private_key_for_cache);
+    {
+        let mut cache = CERT_CACHE.write().unwrap();
+        cache.insert(host.to_string(), cert_key_pair);
+    }
     
     Ok((cert_chain, private_key))
 }

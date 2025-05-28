@@ -1,8 +1,15 @@
 use std::sync::Arc;
-use log::{info, error};
+use log::info;
 
 use crate::config::Config;
-use crate::REQUEST_LOGGER;
+
+/// 도메인 매칭 결과를 나타내는 열거형
+#[derive(Debug)]
+enum MatchResult {
+    ExactMatch(String),
+    WildcardMatch(String, String),
+    NoMatch,
+}
 
 /// 도메인 차단을 처리하는 구조체
 pub struct DomainBlocker {
@@ -21,26 +28,45 @@ impl DomainBlocker {
     pub fn is_blocked(&self, host: &str) -> bool {
         let host_lower = host.to_lowercase();
         
-        // 1. 정확한 도메인 매칭 (예: "naver.com")
-        if self.config.blocked_domains.contains(&host_lower) {
-            info!("차단된 도메인 감지 (정확히 일치): {}", host);
-            return true;
+        // 도메인 매칭 시도
+        match self.match_domain(&host_lower) {
+            MatchResult::ExactMatch(domain) => {
+                info!("차단된 도메인 감지 (정확히 일치): {}", domain);
+                true
+            },
+            MatchResult::WildcardMatch(pattern, domain) => {
+                info!("차단된 도메인 감지 (와일드카드 패턴 {} 일치): {}", pattern, domain);
+                true
+            },
+            MatchResult::NoMatch => false,
+        }
+    }
+    
+    /// 도메인 매칭 함수
+    fn match_domain(&self, host: &str) -> MatchResult {
+        // 1. 정확한 도메인 매칭 시도
+        if self.config.blocked_domains.contains(host) {
+            return MatchResult::ExactMatch(host.to_string());
         }
         
-        // 2. 와일드카드 패턴 매칭 (예: "*.naver.com")
-        for pattern in &self.config.blocked_patterns {
-            if pattern.starts_with("*.") {
-                // *.example.com 형식의 패턴
+        // 2. 와일드카드 패턴 매칭 시도
+        if let Some(pattern) = self.match_wildcard_pattern(host) {
+            return MatchResult::WildcardMatch(pattern, host.to_string());
+        }
+        
+        MatchResult::NoMatch
+    }
+    
+    /// 와일드카드 패턴 매칭
+    fn match_wildcard_pattern(&self, host: &str) -> Option<String> {
+        self.config.blocked_patterns
+            .iter()
+            .filter(|pattern| pattern.starts_with("*."))
+            .find(|pattern| {
                 let domain_suffix = &pattern[1..]; // "*.example.com" -> ".example.com"
-                if host_lower.ends_with(domain_suffix) {
-                    info!("차단된 도메인 감지 (와일드카드 패턴 {} 일치): {}", pattern, host);
-                    return true;
-                }
-            }
-            // 추가 패턴 형식을 여기에 구현할 수 있음
-        }
-        
-        false
+                host.ends_with(domain_suffix)
+            })
+            .map(|pattern| pattern.to_string())
     }
     
     // /// 차단된 요청을 로깅

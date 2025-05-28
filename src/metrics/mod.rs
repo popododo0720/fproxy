@@ -3,7 +3,7 @@ use std::time::{ Duration, Instant };
 use std::sync::{ Arc, Mutex };
 
 use tokio::time;
-use log::{ info, error, warn };
+use log::{ info, error, debug };
 use once_cell::sync::Lazy;
 
 use crate::constants::*;
@@ -15,6 +15,67 @@ struct ResponseTimeStats {
     avg_time_ms: f64,
     min_time_ms: u64,
     max_time_ms: u64,
+}
+
+impl ResponseTimeStats {
+    /// 새 통계 인스턴스 생성
+    fn new() -> Self {
+        Self::default()
+    }
+    
+    /// 새 응답 시간을 추가하고 통계 업데이트
+    fn add_response_time(&mut self, duration_ms: u64) -> &mut Self {
+        // 이전 합계 계산 (평균 * 개수)
+        let prev_total = self.count as f64 * self.avg_time_ms;
+        
+        // 카운트 증가
+        self.count += 1;
+        
+        // 새 평균 계산
+        self.avg_time_ms = (prev_total + duration_ms as f64) / self.count as f64;
+        
+        // 최소값 업데이트 (첫 번째 요청이거나 더 작은 값인 경우)
+        if self.count == 1 || duration_ms < self.min_time_ms {
+            self.min_time_ms = duration_ms;
+        }
+        
+        // 최대값 업데이트
+        self.max_time_ms = self.max_time_ms.max(duration_ms);
+        
+        self
+    }
+    
+    /// 현재 통계 정보를 로그에 출력
+    fn log_current_stats(&self, duration_ms: u64) {
+        debug!("응답 시간 통계 업데이트: count={}, 새 응답시간={}ms, 평균={:.2}ms, 최소={}ms, 최대={}ms", 
+            self.count, duration_ms, self.avg_time_ms, self.min_time_ms, self.max_time_ms);
+    }
+    
+    /// 로그에 자세한 통계 정보 출력
+    fn log_detailed_stats(&self) {
+        info!("--- 응답 시간 통계 ---");
+        info!("총 처리 요청 수: {}", self.count);
+        info!("평균 응답 시간: {:.2} ms", self.avg_time_ms);
+        info!("최소 응답 시간: {} ms", self.min_time_ms);
+        info!("최대 응답 시간: {} ms", self.max_time_ms);
+    }
+    
+    /// 응답 시간이 유효한지 확인
+    fn is_valid_duration(duration_ms: u64) -> bool {
+        // 0ms 응답은 연결 오류 또는 타임아웃일 가능성이 높음
+        if duration_ms == 0 {
+            debug!("응답 시간이 0ms로 측정됨, 통계에서 제외합니다");
+            return false;
+        } 
+        
+        // 30초 초과 응답은 long polling 또는 웹소켓일 가능성이 높음
+        if duration_ms > 30000 {
+            debug!("응답 시간이 {}ms로 비정상적으로 김, 통계에서 제외합니다", duration_ms);
+            return false;
+        }
+        
+        true
+    }
 }
 
 impl Default for ResponseTimeStats {
@@ -30,7 +91,7 @@ impl Default for ResponseTimeStats {
 
 // 응답 시간 통계를 위한 전역 변수
 static RESPONSE_STATS: Lazy<Mutex<ResponseTimeStats>> = Lazy::new(|| {
-    Mutex::new(ResponseTimeStats::default())
+    Mutex::new(ResponseTimeStats::new())
 });
 
 // 전역 메트릭스 인스턴스를 위한 Lazy 정적 변수
@@ -98,112 +159,115 @@ impl Metrics {
 
     // 응답 시간 통계 업데이트
     pub fn update_response_time_stats(&self, duration_ms: u64) {
-        // 비정상적인 응답 시간에 대한 필터링
-        
-        // 0ms 응답 시간은 최소 1ms로 설정
-        let adjusted_duration = if duration_ms == 0 {
-            // 0ms는 실제로 측정하기 어려운 값이므로 최소 1ms로 처리
-            warn!("응답 시간이 0ms로 측정됨, 1ms로 조정합니다");
-            1
-        } else if duration_ms > 30000 { // 30초 초과 응답은 long polling 또는 웹소켓일 가능성이 높음
-            // 긴 응답 시간은 로그에 기록하고 통계에 포함하지 않음
-            warn!("응답 시간이 {}ms로 비정상적으로 김, 통계에서 제외합니다", duration_ms);
+        // 유효하지 않은 응답 시간은 처리하지 않음
+        if !ResponseTimeStats::is_valid_duration(duration_ms) {
             return;
-        } else {
-            duration_ms
-        };
-
-        if let Ok(mut stats) = RESPONSE_STATS.lock() {
-            let prev_total = stats.count as f64 * stats.avg_time_ms;
-            stats.count += 1;
-            stats.avg_time_ms = (prev_total + adjusted_duration as f64) / stats.count as f64;
-            
-            // 첫 번째 요청이거나 새 값이 더 작을 때만 최소값 업데이트
-            if stats.count == 1 || adjusted_duration < stats.min_time_ms {
-                stats.min_time_ms = adjusted_duration;
-            }
-            
-            // 최대값 제한: 30초를 초과하는 경우 최대값 업데이트 방지 (선택 사항)
-            if adjusted_duration <= 30000 {
-                stats.max_time_ms = stats.max_time_ms.max(adjusted_duration);
-            }
-            
-            info!("응답 시간 통계 업데이트: count={}, 새 응답시간={}ms, 평균={:.2}ms, 최소={}ms, 최대={}ms", 
-                stats.count, adjusted_duration, stats.avg_time_ms, stats.min_time_ms, stats.max_time_ms);
-        } else {
-            error!("응답 시간 통계 업데이트 실패: 락 획득 실패");
         }
+
+        // 응답 시간 통계 업데이트
+        RESPONSE_STATS
+            .lock()
+            .map(|mut stats| {
+                stats.add_response_time(duration_ms)
+                     .log_current_stats(duration_ms);
+            })
+            .unwrap_or_else(|_| {
+                error!("응답 시간 통계 업데이트 실패: 락 획득 실패");
+            });
     }
 
     pub fn print_stats(&self) {
-        let total_connection_opened = self.total_connection_opened.load(Ordering::Relaxed);
-        let total_error_count = self.total_error_count.load(Ordering::Relaxed);
-        let http_connections = self.http_connections.load(Ordering::Relaxed);
-        let http_active_connections = self.http_active_connections.load(Ordering::Relaxed);
-        let http_bytes_transferred_in = self.http_bytes_transferred_in.load(Ordering::Relaxed);
-        let http_bytes_transferred_out = self.http_bytes_transferred_out.load(Ordering::Relaxed);
-        let http_request_count = self.http_request_count.load(Ordering::Relaxed);
-        let tls_connections = self.tls_connections.load(Ordering::Relaxed);
-        let tls_active_connections = self.tls_active_connections.load(Ordering::Relaxed);
-        let tls_bytes_transferred_in = self.tls_bytes_transferred_in.load(Ordering::Relaxed);
-        let tls_bytes_transferred_out = self.tls_bytes_transferred_out.load(Ordering::Relaxed);
-        let tls_request_count = self.tls_request_count.load(Ordering::Relaxed);
-        let start_time = self.start_time.elapsed().as_secs();
-
-        // 총 전송량 계산
-        let total_in_mb = Self::bytes_to_mb(http_bytes_transferred_in + tls_bytes_transferred_in);
-        let total_out_mb = Self::bytes_to_mb(http_bytes_transferred_out + tls_bytes_transferred_out);
+        // 모든 카운터 값을 한 번에 로드 (메모리 순서 일관성 유지)
+        let metrics = self.load_all_metrics();
         
-        // HTTP 전송량
-        let http_in_mb = Self::bytes_to_mb(http_bytes_transferred_in);
-        let http_out_mb = Self::bytes_to_mb(http_bytes_transferred_out);
+        // 데이터 전송량 계산
+        let transfer_stats = self.calculate_transfer_stats(&metrics);
         
-        // TLS 전송량
-        let tls_in_mb = Self::bytes_to_mb(tls_bytes_transferred_in);
-        let tls_out_mb = Self::bytes_to_mb(tls_bytes_transferred_out);
-
         // 응답 시간 통계 가져오기
-        let response_stats = if let Ok(stats) = RESPONSE_STATS.lock() {
-            Some(*stats)
-        } else {
-            None
-        };
+        let response_stats = RESPONSE_STATS.lock().ok().map(|stats| *stats);
 
-        info!("=== 프록시 서버 통계 ===");
-        info!("가동 시간: {}초", start_time);
-        info!("총 연결 수: {}", total_connection_opened);
-        info!("총 HTTP 연결 수: {}", http_connections);
-        info!("총 HTTPS 연결 수: {}", tls_connections);
-        info!("총 활성 연결 수: {}", http_active_connections + tls_active_connections);
-        info!("활성 HTTP 연결 수: {}", http_active_connections);
-        info!("활성 HTTPS 연결 수: {}", tls_active_connections);
+        // 로그 출력
+        self.log_basic_stats(&metrics);
+        self.log_transfer_stats(&transfer_stats);
+        self.log_request_stats(&metrics);
         
-        info!("--- 전송 데이터 ---");
-        info!("총 수신 데이터: {:.2} MB", total_in_mb);
-        info!("총 송신 데이터: {:.2} MB", total_out_mb);
-        info!("HTTP 수신 데이터: {:.2} MB", http_in_mb);
-        info!("HTTP 송신 데이터: {:.2} MB", http_out_mb);
-        info!("HTTPS 수신 데이터: {:.2} MB", tls_in_mb);
-        info!("HTTPS 송신 데이터: {:.2} MB", tls_out_mb);
-        
-        info!("--- 요청 통계 ---");
-        info!("HTTP 요청 수: {}", http_request_count);
-        info!("HTTPS 요청 수: {}", tls_request_count);
-        info!("총 요청 수: {}", http_request_count + tls_request_count);
-        info!("오류 수: {}", total_error_count);
-        
-        // 응답 시간 통계 추가
+        // 응답 시간 통계 출력
         if let Some(stats) = response_stats {
             if stats.count > 0 {
-                info!("--- 응답 시간 통계 ---");
-                info!("총 처리 요청 수: {}", stats.count);
-                info!("평균 응답 시간: {:.2} ms", stats.avg_time_ms);
-                info!("최소 응답 시간: {} ms", stats.min_time_ms);
-                info!("최대 응답 시간: {} ms", stats.max_time_ms);
+                self.log_response_time_stats(&stats);
             }
         }
         
         info!("======================");
+    }
+    
+    // 모든 메트릭스 데이터를 구조체로 로드
+    fn load_all_metrics(&self) -> MetricsSnapshot {
+        MetricsSnapshot {
+            total_connection_opened: self.total_connection_opened.load(Ordering::Relaxed),
+            total_error_count: self.total_error_count.load(Ordering::Relaxed),
+            http_connections: self.http_connections.load(Ordering::Relaxed),
+            http_active_connections: self.http_active_connections.load(Ordering::Relaxed),
+            http_bytes_transferred_in: self.http_bytes_transferred_in.load(Ordering::Relaxed),
+            http_bytes_transferred_out: self.http_bytes_transferred_out.load(Ordering::Relaxed),
+            http_request_count: self.http_request_count.load(Ordering::Relaxed),
+            tls_connections: self.tls_connections.load(Ordering::Relaxed),
+            tls_active_connections: self.tls_active_connections.load(Ordering::Relaxed),
+            tls_bytes_transferred_in: self.tls_bytes_transferred_in.load(Ordering::Relaxed),
+            tls_bytes_transferred_out: self.tls_bytes_transferred_out.load(Ordering::Relaxed),
+            tls_request_count: self.tls_request_count.load(Ordering::Relaxed),
+            start_time: self.start_time.elapsed().as_secs(),
+        }
+    }
+    
+    // 전송 통계 계산
+    fn calculate_transfer_stats(&self, metrics: &MetricsSnapshot) -> TransferStats {
+        TransferStats {
+            total_in_mb: Self::bytes_to_mb(
+                metrics.http_bytes_transferred_in + metrics.tls_bytes_transferred_in
+            ),
+            total_out_mb: Self::bytes_to_mb(
+                metrics.http_bytes_transferred_out + metrics.tls_bytes_transferred_out
+            ),
+            http_in_mb: Self::bytes_to_mb(metrics.http_bytes_transferred_in),
+            http_out_mb: Self::bytes_to_mb(metrics.http_bytes_transferred_out),
+            tls_in_mb: Self::bytes_to_mb(metrics.tls_bytes_transferred_in),
+            tls_out_mb: Self::bytes_to_mb(metrics.tls_bytes_transferred_out),
+        }
+    }
+    
+    // 기본 통계 로깅
+    fn log_basic_stats(&self, metrics: &MetricsSnapshot) {
+        info!("=== 프록시 서버 통계 ===");
+        info!("가동 시간: {}초", metrics.start_time);
+        info!("총 연결 수: {}", metrics.total_connection_opened);
+        info!("총 HTTP 연결 수: {}", metrics.http_connections);
+        info!("총 HTTPS 연결 수: {}", metrics.tls_connections);
+        info!("총 활성 연결 수: {}", 
+            metrics.http_active_connections + metrics.tls_active_connections);
+        info!("활성 HTTP 연결 수: {}", metrics.http_active_connections);
+        info!("활성 HTTPS 연결 수: {}", metrics.tls_active_connections);
+    }
+    
+    // 데이터 전송 통계 로깅
+    fn log_transfer_stats(&self, stats: &TransferStats) {
+        info!("--- 전송 데이터 ---");
+        info!("총 수신 데이터: {:.2} MB", stats.total_in_mb);
+        info!("총 송신 데이터: {:.2} MB", stats.total_out_mb);
+        info!("HTTP 수신 데이터: {:.2} MB", stats.http_in_mb);
+        info!("HTTP 송신 데이터: {:.2} MB", stats.http_out_mb);
+        info!("HTTPS 수신 데이터: {:.2} MB", stats.tls_in_mb);
+        info!("HTTPS 송신 데이터: {:.2} MB", stats.tls_out_mb);
+    }
+    
+    // 요청 통계 로깅
+    fn log_request_stats(&self, metrics: &MetricsSnapshot) {
+        info!("--- 요청 통계 ---");
+        info!("HTTP 요청 수: {}", metrics.http_request_count);
+        info!("HTTPS 요청 수: {}", metrics.tls_request_count);
+        info!("총 요청 수: {}", 
+            metrics.http_request_count + metrics.tls_request_count);
+        info!("오류 수: {}", metrics.total_error_count);
     }
 
     // 커넥션 생성시 카운트 증가
@@ -269,5 +333,39 @@ impl Metrics {
             self.http_active_connections.fetch_sub(1, Ordering::Relaxed);
         }
     }
+
+    // 응답 시간 통계 로깅
+    fn log_response_time_stats(&self, stats: &ResponseTimeStats) {
+        stats.log_detailed_stats();
+    }
+}
+
+// 메트릭스 스냅샷 데이터 구조체
+#[derive(Debug)]
+struct MetricsSnapshot {
+    total_connection_opened: u64,
+    total_error_count: u64,
+    http_connections: u64,
+    http_active_connections: u64,
+    http_bytes_transferred_in: u64,
+    http_bytes_transferred_out: u64,
+    http_request_count: u64,
+    tls_connections: u64,
+    tls_active_connections: u64,
+    tls_bytes_transferred_in: u64,
+    tls_bytes_transferred_out: u64,
+    tls_request_count: u64,
+    start_time: u64,
+}
+
+// 전송 통계 구조체
+#[derive(Debug)]
+struct TransferStats {
+    total_in_mb: f64,
+    total_out_mb: f64,
+    http_in_mb: f64,
+    http_out_mb: f64,
+    tls_in_mb: f64,
+    tls_out_mb: f64,
 }
 
