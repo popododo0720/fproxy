@@ -1,7 +1,8 @@
 use std::sync::Arc;
-use log::{info};
+use log::{info, error};
 
 use crate::config::Config;
+use crate::REQUEST_LOGGER;
 
 /// 도메인 차단을 처리하는 구조체
 pub struct DomainBlocker {
@@ -41,6 +42,15 @@ impl DomainBlocker {
         
         false
     }
+    
+    // /// 차단된 요청을 로깅
+    // pub async fn log_blocked_request(&self, request_data: &str, host: &str, ip: &str, session_id: &str) {
+    //     if let Ok(logger) = REQUEST_LOGGER.try_lock() {
+    //         logger.log_rejected_request(request_data, host, ip, session_id).await;
+    //     } else {
+    //         error!("[Session:{}] Failed to acquire RequestLogger lock for blocked request logging", session_id);
+    //     }
+    // }
     
     // /// 대규모 도메인 목록 로드 (향후 확장용)
     // pub fn load_blocklist(&mut self, _path: &str) -> Result<(), std::io::Error> {

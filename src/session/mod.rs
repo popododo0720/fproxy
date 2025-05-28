@@ -4,10 +4,10 @@ use std::time::{Duration, Instant};
 use std::error::Error;
 use std::os::unix::io::{AsRawFd};
 use std::os::unix::io::FromRawFd;
+use socket2::Socket;
 
 use bytes::BytesMut;
 use log::{trace, debug, info, error};
-use socket2::{Socket};
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt,AsyncWriteExt};
 
@@ -159,9 +159,19 @@ impl Session {
         if self.domain_blocker.is_blocked(&host) {
             info!("[Session:{}] Blocked access to domain: {}", self.session_id(), host);
             
+            // 원본 요청 데이터 및 클라이언트 IP 주소 가져오기
+            let request_data = String::from_utf8_lossy(&buffer[0..n]).to_string();
+            let client_ip = self.client_addr.ip().to_string();
+            
             if !is_connect {
                 // HTTP 차단 페이지 전송
-                if let Err(e) = self.block_page.send_http_block_page(&mut client_stream, &host, &self.session_id()).await {
+                if let Err(e) = self.block_page.send_http_block_page(
+                    &mut client_stream, 
+                    &host, 
+                    &self.session_id(),
+                    Some(&request_data),
+                    Some(&client_ip)
+                ).await {
                     error!("[Session:{}] Failed to send HTTP block page: {}", self.session_id(), e);
                 }
                 
@@ -172,7 +182,13 @@ impl Session {
                 return Ok(());
             } else {
                 // HTTPS 차단 페이지 전송
-                if let Err(e) = self.block_page.handle_https_block(client_stream, &host, &self.session_id()).await {
+                if let Err(e) = self.block_page.handle_https_block(
+                    client_stream, 
+                    &host, 
+                    &self.session_id(),
+                    Some(&request_data),
+                    Some(&client_ip)
+                ).await {
                     error!("[Session:{}] Failed to handle HTTPS block: {}", self.session_id(), e);
                 }
                 
@@ -207,8 +223,9 @@ impl Session {
                 Ok(real_tls_stream) => {
                     info!("[Session:{}] Connected to real server {} over TLS", self.session_id(), host);
                     
-                    // 3. 중간에서 데이터 가로채기
-                    proxy_tls_streams(tls_stream, real_tls_stream, Arc::clone(&self.metrics), &self.session_id(), &host).await?;
+                    // 3. 중간에서 데이터 가로채기 - 요청 시작 시간 전달
+                    let request_start_time = Instant::now();
+                    proxy_tls_streams(tls_stream, real_tls_stream, Arc::clone(&self.metrics), &self.session_id(), &host, request_start_time).await?;
                     
                     // 연결 종료 시 활성 연결 카운트 감소
                     self.metrics.connection_closed(true);
@@ -284,9 +301,10 @@ impl Session {
                 pool.return_buffer(buffer);
             }
             
-            // 프록시 시작
+            // 프록시 시작 - 요청 시작 시간 전달
             info!("[Session:{}] Starting HTTP proxy for {}", self.session_id(), host);
-            proxy_http_streams(client_stream, server_stream, Arc::clone(&self.metrics), &self.session_id()).await?;
+            let request_start_time = Instant::now();
+            proxy_http_streams(client_stream, server_stream, Arc::clone(&self.metrics), &self.session_id(), request_start_time).await?;
             
             // 연결 종료 시 활성 연결 카운트 감소
             self.metrics.connection_closed(false);

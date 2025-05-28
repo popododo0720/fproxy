@@ -21,6 +21,7 @@ use constants::*;
 use buffer::BufferPool;
 use server::ProxyServer;
 use tls::init_root_ca;
+use acl::request_logger::RequestLogger;
 
 
 static FD_LIMIT: Lazy<u64> = Lazy::new(|| {
@@ -28,6 +29,11 @@ static FD_LIMIT: Lazy<u64> = Lazy::new(|| {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(100000) // 100K
+});
+
+// 전역 RequestLogger 인스턴스
+static REQUEST_LOGGER: Lazy<Arc<tokio::sync::Mutex<RequestLogger>>> = Lazy::new(|| {
+    Arc::new(tokio::sync::Mutex::new(RequestLogger::new()))
 });
 
 #[tokio::main]
@@ -84,6 +90,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         LARGE_POOL_SIZE   // 1MB
     ));
     info!("initializing buffer pool: small {}, medium {}, large {}", SMALL_POOL_SIZE, MEDIUM_POOL_SIZE, LARGE_POOL_SIZE);
+
+    // RequestLogger 초기화
+    {
+        let mut logger = REQUEST_LOGGER.lock().await;
+        if let Err(e) = logger.init().await {
+            error!("Failed to initialize RequestLogger: {}", e);
+        } else {
+            info!("RequestLogger initialized successfully");
+        }
+    }
 
     // TLS 루트 CA 인증서 초기화
     if let Err(e) = init_root_ca() {

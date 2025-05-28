@@ -1,12 +1,37 @@
 use std::sync::atomic::{ AtomicU64, Ordering };
 use std::time::{ Duration, Instant };
-use std::sync::{ Arc };
+use std::sync::{ Arc, Mutex };
 
 use tokio::time;
-use log::{ info, debug };
+use log::{ info, error, warn };
 use once_cell::sync::Lazy;
 
 use crate::constants::*;
+
+// 평균 응답 시간 저장용 구조체
+#[derive(Debug, Clone, Copy)]
+struct ResponseTimeStats {
+    count: u64,
+    avg_time_ms: f64,
+    min_time_ms: u64,
+    max_time_ms: u64,
+}
+
+impl Default for ResponseTimeStats {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            avg_time_ms: 0.0,
+            min_time_ms: 0,
+            max_time_ms: 0,
+        }
+    }
+}
+
+// 응답 시간 통계를 위한 전역 변수
+static RESPONSE_STATS: Lazy<Mutex<ResponseTimeStats>> = Lazy::new(|| {
+    Mutex::new(ResponseTimeStats::default())
+});
 
 // 전역 메트릭스 인스턴스를 위한 Lazy 정적 변수
 static METRICS_INSTANCE: Lazy<Arc<Metrics>> = Lazy::new(|| {
@@ -71,6 +96,45 @@ impl Metrics {
         bytes as f64 / (1024.0 * 1024.0)
     }
 
+    // 응답 시간 통계 업데이트
+    pub fn update_response_time_stats(&self, duration_ms: u64) {
+        // 비정상적인 응답 시간에 대한 필터링
+        
+        // 0ms 응답 시간은 최소 1ms로 설정
+        let adjusted_duration = if duration_ms == 0 {
+            // 0ms는 실제로 측정하기 어려운 값이므로 최소 1ms로 처리
+            warn!("응답 시간이 0ms로 측정됨, 1ms로 조정합니다");
+            1
+        } else if duration_ms > 30000 { // 30초 초과 응답은 long polling 또는 웹소켓일 가능성이 높음
+            // 긴 응답 시간은 로그에 기록하고 통계에 포함하지 않음
+            warn!("응답 시간이 {}ms로 비정상적으로 김, 통계에서 제외합니다", duration_ms);
+            return;
+        } else {
+            duration_ms
+        };
+
+        if let Ok(mut stats) = RESPONSE_STATS.lock() {
+            let prev_total = stats.count as f64 * stats.avg_time_ms;
+            stats.count += 1;
+            stats.avg_time_ms = (prev_total + adjusted_duration as f64) / stats.count as f64;
+            
+            // 첫 번째 요청이거나 새 값이 더 작을 때만 최소값 업데이트
+            if stats.count == 1 || adjusted_duration < stats.min_time_ms {
+                stats.min_time_ms = adjusted_duration;
+            }
+            
+            // 최대값 제한: 30초를 초과하는 경우 최대값 업데이트 방지 (선택 사항)
+            if adjusted_duration <= 30000 {
+                stats.max_time_ms = stats.max_time_ms.max(adjusted_duration);
+            }
+            
+            info!("응답 시간 통계 업데이트: count={}, 새 응답시간={}ms, 평균={:.2}ms, 최소={}ms, 최대={}ms", 
+                stats.count, adjusted_duration, stats.avg_time_ms, stats.min_time_ms, stats.max_time_ms);
+        } else {
+            error!("응답 시간 통계 업데이트 실패: 락 획득 실패");
+        }
+    }
+
     pub fn print_stats(&self) {
         let total_connection_opened = self.total_connection_opened.load(Ordering::Relaxed);
         let total_error_count = self.total_error_count.load(Ordering::Relaxed);
@@ -98,6 +162,13 @@ impl Metrics {
         let tls_in_mb = Self::bytes_to_mb(tls_bytes_transferred_in);
         let tls_out_mb = Self::bytes_to_mb(tls_bytes_transferred_out);
 
+        // 응답 시간 통계 가져오기
+        let response_stats = if let Ok(stats) = RESPONSE_STATS.lock() {
+            Some(*stats)
+        } else {
+            None
+        };
+
         info!("=== 프록시 서버 통계 ===");
         info!("가동 시간: {}초", start_time);
         info!("총 연결 수: {}", total_connection_opened);
@@ -120,6 +191,18 @@ impl Metrics {
         info!("HTTPS 요청 수: {}", tls_request_count);
         info!("총 요청 수: {}", http_request_count + tls_request_count);
         info!("오류 수: {}", total_error_count);
+        
+        // 응답 시간 통계 추가
+        if let Some(stats) = response_stats {
+            if stats.count > 0 {
+                info!("--- 응답 시간 통계 ---");
+                info!("총 처리 요청 수: {}", stats.count);
+                info!("평균 응답 시간: {:.2} ms", stats.avg_time_ms);
+                info!("최소 응답 시간: {} ms", stats.min_time_ms);
+                info!("최대 응답 시간: {} ms", stats.max_time_ms);
+            }
+        }
+        
         info!("======================");
     }
 
@@ -136,14 +219,12 @@ impl Metrics {
     // 요청카운트 증가
     pub fn increment_request_count(&self, https_flag: bool) {
         if https_flag {
-            debug!("TLS 요청 카운트 증가");
             self.tls_request_count.fetch_add(1, Ordering::Relaxed);
             self.tls_connections.fetch_add(1, Ordering::Relaxed);
             self.tls_active_connections.fetch_add(1, Ordering::Relaxed);
             // 모든 연결을 집계하기 위해 추가
             self.total_connection_opened();
         } else {
-            debug!("HTTP 요청 카운트 증가");
             self.http_request_count.fetch_add(1, Ordering::Relaxed);
             self.http_connections.fetch_add(1, Ordering::Relaxed);
             self.http_active_connections.fetch_add(1, Ordering::Relaxed);
@@ -155,46 +236,36 @@ impl Metrics {
     // HTTP 수신 데이터 추가
     pub fn add_http_bytes_in(&self, bytes: u64) {
         if bytes > 0 {
-            debug!("HTTP 수신 데이터 추가: {} bytes", bytes);
-            let prev = self.http_bytes_transferred_in.fetch_add(bytes, Ordering::Relaxed);
-            debug!("HTTP 수신 데이터 업데이트: {} -> {}", prev, prev + bytes);
+            self.http_bytes_transferred_in.fetch_add(bytes, Ordering::Relaxed);
         }
     }
 
     // HTTP 송신 데이터 추가
     pub fn add_http_bytes_out(&self, bytes: u64) {
         if bytes > 0 {
-            debug!("HTTP 송신 데이터 추가: {} bytes", bytes);
-            let prev = self.http_bytes_transferred_out.fetch_add(bytes, Ordering::Relaxed);
-            debug!("HTTP 송신 데이터 업데이트: {} -> {}", prev, prev + bytes);
+            self.http_bytes_transferred_out.fetch_add(bytes, Ordering::Relaxed);
         }
     }
 
     // TLS 수신 데이터 추가
     pub fn add_tls_bytes_in(&self, bytes: u64) {
         if bytes > 0 {
-            debug!("TLS 수신 데이터 추가: {} bytes", bytes);
-            let prev = self.tls_bytes_transferred_in.fetch_add(bytes, Ordering::Relaxed);
-            debug!("TLS 수신 데이터 업데이트: {} -> {}", prev, prev + bytes);
+            self.tls_bytes_transferred_in.fetch_add(bytes, Ordering::Relaxed);
         }
     }
 
     // TLS 송신 데이터 추가
     pub fn add_tls_bytes_out(&self, bytes: u64) {
         if bytes > 0 {
-            debug!("TLS 송신 데이터 추가: {} bytes", bytes);
-            let prev = self.tls_bytes_transferred_out.fetch_add(bytes, Ordering::Relaxed);
-            debug!("TLS 송신 데이터 업데이트: {} -> {}", prev, prev + bytes);
+            self.tls_bytes_transferred_out.fetch_add(bytes, Ordering::Relaxed);
         }
     }
     
     // 연결 종료시 카운트 감소
     pub fn connection_closed(&self, https_flag: bool) {
         if https_flag {
-            debug!("TLS 연결 종료");
             self.tls_active_connections.fetch_sub(1, Ordering::Relaxed);
         } else {
-            debug!("HTTP 연결 종료");
             self.http_active_connections.fetch_sub(1, Ordering::Relaxed);
         }
     }

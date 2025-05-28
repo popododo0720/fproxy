@@ -5,6 +5,7 @@ use log::{debug, error, info};
 use chrono;
 
 use crate::tls::{generate_fake_cert, accept_tls_with_cert};
+use crate::REQUEST_LOGGER;
 
 /// 차단 페이지 생성 및 전송을 담당하는 구조체
 pub struct BlockPage;
@@ -40,8 +41,6 @@ impl BlockPage {
                         <p><strong>차단 시간:</strong> {}</p>\
                     </div>\
                     <p>문의사항이 있으시면 네트워크 관리자에게 연락하세요.</p>\
-                    <!-- 이용 정책 페이지 URL (실제 정책 페이지로 변경 필요) -->\
-                    <a href=\"https://example.com/acceptable-use-policy\" class=\"button\">이용 정책 확인하기</a>\
                 </div>\
             </body>\
             </html>", 
@@ -90,8 +89,6 @@ impl BlockPage {
                         <p><strong>차단 시간:</strong> {}</p>\
                     </div>\
                     <p>문의사항이 있으시면 네트워크 관리자에게 연락하세요.</p>\
-                    <!-- 이용 정책 페이지 URL (실제 정책 페이지로 변경 필요) -->\
-                    <a href=\"https://example.com/acceptable-use-policy\" class=\"button\">이용 정책 확인하기</a>\
                 </div>\
             </body>\
             </html>", 
@@ -111,8 +108,23 @@ impl BlockPage {
         )
     }
     
+    /// 차단 요청 로깅
+    async fn log_blocked_request(&self, request_data: &str, host: &str, ip: &str, session_id: &str) {
+        if let Ok(logger) = REQUEST_LOGGER.try_lock() {
+            let log_content = format!("{} [BLOCKED]\n", request_data);
+            logger.log_rejected_request(log_content.as_str(), host, ip, session_id).await;
+        } else {
+            error!("[Session:{}] Failed to acquire RequestLogger lock for blocked request logging", session_id);
+        }
+    }
+    
     /// HTTP 차단 페이지 전송
-    pub async fn send_http_block_page(&self, client_stream: &mut TcpStream, host: &str, session_id: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+    pub async fn send_http_block_page(&self, client_stream: &mut TcpStream, host: &str, session_id: &str, request: Option<&str>, client_ip: Option<&str>) -> Result<(), Box<dyn Error + Send + Sync>> {
+        // 요청 로깅
+        if let (Some(req), Some(ip)) = (request, client_ip) {
+            self.log_blocked_request(req, host, ip, session_id).await;
+        }
+        
         let blocked_message = self.create_http_block_page(host);
         
         // 차단 메시지 전송 시도
@@ -137,7 +149,12 @@ impl BlockPage {
     }
     
     /// HTTPS 차단 페이지 전송 (CONNECT 요청 처리 포함)
-    pub async fn handle_https_block(&self, mut client_stream: TcpStream, host: &str, session_id: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+    pub async fn handle_https_block(&self, mut client_stream: TcpStream, host: &str, session_id: &str, request: Option<&str>, client_ip: Option<&str>) -> Result<(), Box<dyn Error + Send + Sync>> {
+        // 요청 로깅
+        if let (Some(req), Some(ip)) = (request, client_ip) {
+            self.log_blocked_request(req, host, ip, session_id).await;
+        }
+        
         // 1. 일단 CONNECT 요청을 승인하고 TLS 핸드셰이크 진행
         let response = "HTTP/1.1 200 Connection Established\r\nConnection: keep-alive\r\n\r\n";
         match client_stream.write_all(response.as_bytes()).await {
