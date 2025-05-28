@@ -57,7 +57,7 @@ impl PartitionManager {
                 target_ip TEXT NOT NULL,
                 response_time BIGINT,
                 is_rejected BOOLEAN NOT NULL DEFAULT FALSE,
-                is_tls BOOLEAN NOT NULL DEFAULT FALSE,
+                is_tls BOOLEAN NOT NULL DEFAULT FALSE
             ) PARTITION BY RANGE (timestamp)".to_string();
         
         client.execute(&request_logs_query, &[]).await?;
