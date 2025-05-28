@@ -7,6 +7,9 @@ use std::collections::HashMap;
 use log::{debug, error, info, warn};
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use bytes::{BytesMut, BufMut};
+use httparse;
+use memmem::{Searcher, TwoWaySearcher};
 
 use crate::metrics::Metrics;
 use crate::constants::*;
@@ -28,66 +31,73 @@ pub async fn proxy_http_streams(
     // HTTP 요청 감지 상태
     let parsing_request = Arc::new(RwLock::new(false));
     let current_request_id = Arc::new(RwLock::new(0_u64));
-    let request_buffer = Arc::new(RwLock::new(Vec::new()));
+    
+    // 패턴 상수 정의
+    let header_end = b"\r\n\r\n";
+    let chunk_end = b"\r\n0\r\n\r\n";
     
     // 양방향 데이터 전송 설정
     let client_to_server = {
         let request_times = Arc::clone(&request_times);
         let parsing_request = Arc::clone(&parsing_request);
         let current_request_id = Arc::clone(&current_request_id);
-        let request_buffer = Arc::clone(&request_buffer);
         let metrics_clone = Arc::clone(&metrics);
         
         async move {
-            let mut buffer = vec![0u8; BUFFER_SIZE_SMALL];
             let mut total_bytes = 0u64;
+            let mut req_buffer = BytesMut::with_capacity(BUFFER_SIZE_SMALL);
+            let header_searcher = TwoWaySearcher::new(header_end);
             
             loop {
-                match client_read.read(&mut buffer).await {
+                let mut buffer = BytesMut::with_capacity(BUFFER_SIZE_SMALL);
+                
+                match client_read.read_buf(&mut buffer).await {
                     Ok(0) => break, // 연결 종료
                     Ok(n) => {
-                        // 서버로 데이터 전송하기 전에 HTTP 요청 감지
-                        let data_slice = &buffer[0..n];
+                        // HTTP 요청 감지 및 파싱
+                        let mut headers = [httparse::EMPTY_HEADER; 64];
+                        let mut req = httparse::Request::new(&mut headers);
                         
-                        // HTTP 요청 처리 
-                        if let Ok(data_str) = std::str::from_utf8(data_slice) {
-                            if !*parsing_request.read().unwrap() {
-                                // 새로운 요청 감지 (GET, POST, PUT, DELETE 등으로 시작)
-                                if data_str.starts_with("GET ") || data_str.starts_with("POST ") || 
-                                   data_str.starts_with("PUT ") || data_str.starts_with("DELETE ") || 
-                                   data_str.starts_with("HEAD ") || data_str.starts_with("OPTIONS ") {
-                                    
-                                    // 새 요청 ID 할당 및 시작 시간 기록
-                                    let mut req_id = current_request_id.write().unwrap();
-                                    *req_id += 1;
-                                    let request_id = *req_id;
-                                    
-                                    // 요청 시작 시간 기록
-                                    request_times.write().unwrap().insert(request_id, Instant::now());
-                                    *parsing_request.write().unwrap() = true;
-                                    
-                                    debug!("[Session:{}] 새 HTTP 요청 #{} 감지: {}", 
-                                          session_id, request_id, data_str.lines().next().unwrap_or(""));
-                                    
-                                    // 요청 버퍼에 데이터 저장
-                                    request_buffer.write().unwrap().clear();
-                                    request_buffer.write().unwrap().extend_from_slice(data_slice);
-                                }
-                            } else {
-                                // 이미 요청을 처리 중인 경우 버퍼에 추가
-                                request_buffer.write().unwrap().extend_from_slice(data_slice);
-                                
-                                // 요청 종료 확인 (헤더 끝 표시 "\r\n\r\n" 찾기)
-                                if let Ok(buffer_str) = std::str::from_utf8(&request_buffer.read().unwrap()) {
-                                    if buffer_str.contains("\r\n\r\n") {
-                                        debug!("[Session:{}] HTTP 요청 헤더 완료", session_id);
+                        // 요청 버퍼가 비어있고 새로운 요청이 시작되는 경우
+                        if !*parsing_request.read().unwrap() && !buffer.is_empty() {
+                            if let Ok(status) = req.parse(&buffer) {
+                                if status.is_partial() || status.is_complete() {
+                                    // 새 요청 감지
+                                    if let Some(method) = req.method {
+                                        if method == "GET" || method == "POST" || method == "PUT" || 
+                                           method == "DELETE" || method == "HEAD" || method == "OPTIONS" {
+                                            // 새 요청 ID 할당 및 시작 시간 기록
+                                            let mut req_id = current_request_id.write().unwrap();
+                                            *req_id += 1;
+                                            let request_id = *req_id;
+                                            
+                                            // 요청 시작 시간 기록
+                                            request_times.write().unwrap().insert(request_id, Instant::now());
+                                            *parsing_request.write().unwrap() = true;
+                                            
+                                            debug!("[Session:{}] 새 HTTP 요청 #{} 감지: {} {}", 
+                                                  session_id, request_id, method, req.path.unwrap_or(""));
+                                            
+                                            // 요청 버퍼 초기화
+                                            req_buffer.clear();
+                                            req_buffer.put_slice(&buffer);
+                                        }
                                     }
                                 }
+                            }
+                        } else if *parsing_request.read().unwrap() {
+                            // 이미 요청을 처리 중인 경우 버퍼에 추가
+                            req_buffer.put_slice(&buffer);
+                            
+                            // 요청 헤더 완료 여부 확인 (속도 향상을 위해 바이트 패턴 검색)
+                            let buf_bytes = req_buffer.as_ref();
+                            if header_searcher.search_in(buf_bytes).is_some() {
+                                debug!("[Session:{}] HTTP 요청 헤더 완료", session_id);
                             }
                         }
                         
                         // 서버로 데이터 전송
-                        if let Err(e) = server_write.write_all(&buffer[0..n]).await {
+                        if let Err(e) = server_write.write_all(&buffer).await {
                             error!("[Session:{}] Failed to write to server: {}", session_id, e);
                             break;
                         }
@@ -121,18 +131,21 @@ pub async fn proxy_http_streams(
         let metrics_clone = Arc::clone(&metrics);
         
         async move {
-            let mut buffer = vec![0u8; BUFFER_SIZE_SMALL];
             let mut total_bytes = 0u64;
-            let mut response_buffer = Vec::new();
+            let mut resp_buffer = BytesMut::with_capacity(BUFFER_SIZE_MEDIUM);
             let mut is_reading_response = false;
             let mut current_response_for = 0_u64;
+            let header_searcher = TwoWaySearcher::new(header_end);
+            let chunk_searcher = TwoWaySearcher::new(chunk_end);
             
             loop {
-                match server_read.read(&mut buffer).await {
+                let mut buffer = BytesMut::with_capacity(BUFFER_SIZE_SMALL);
+                
+                match server_read.read_buf(&mut buffer).await {
                     Ok(0) => break, // 연결 종료
                     Ok(n) => {
                         // 클라이언트로 데이터 전송
-                        if let Err(e) = client_write.write_all(&buffer[0..n]).await {
+                        if let Err(e) = client_write.write_all(&buffer).await {
                             error!("[Session:{}] Failed to write to client: {}", session_id, e);
                             break;
                         }
@@ -142,13 +155,16 @@ pub async fn proxy_http_streams(
                         metrics_clone.add_http_bytes_out(n as u64);
                         
                         // HTTP 응답 감지 및 처리
-                        let data_slice = &buffer[0..n];
+                        let mut headers = [httparse::EMPTY_HEADER; 64];
+                        let mut resp = httparse::Response::new(&mut headers);
+                        
                         if !is_reading_response {
-                            if let Ok(data_str) = std::str::from_utf8(data_slice) {
-                                if data_str.starts_with("HTTP/") {
+                            // 새로운 응답 감지
+                            if let Ok(status) = resp.parse(&buffer) {
+                                if status.is_partial() || status.is_complete() {
                                     is_reading_response = true;
-                                    response_buffer.clear();
-                                    response_buffer.extend_from_slice(data_slice);
+                                    resp_buffer.clear();
+                                    resp_buffer.put_slice(&buffer);
                                     
                                     // 현재 처리 중인 요청 ID 가져오기
                                     current_response_for = *current_request_id.read().unwrap();
@@ -159,31 +175,38 @@ pub async fn proxy_http_streams(
                             }
                         } else {
                             // 응답 데이터 축적
-                            response_buffer.extend_from_slice(data_slice);
+                            resp_buffer.put_slice(&buffer);
                             
                             // 응답 종료 확인
-                            if let Ok(resp_str) = std::str::from_utf8(&response_buffer) {
-                                // 응답 헤더 확인
-                                if resp_str.contains("\r\n\r\n") {
-                                    // 헤더 분석을 위해 헤더와 본문 분리
-                                    let parts: Vec<&str> = resp_str.split("\r\n\r\n").collect();
-                                    let headers = parts[0].to_lowercase();
-                                    
-                                    // Content-Length 또는 Transfer-Encoding 확인
-                                    let mut response_completed = false;
+                            let mut response_completed = false;
+                            let resp_bytes = resp_buffer.as_ref();
+                            
+                            // 헤더 끝 위치 찾기
+                            if let Some(headers_end_pos) = header_searcher.search_in(resp_bytes) {
+                                let headers_end_pos = headers_end_pos + 4; // \r\n\r\n 길이 포함
+                                
+                                // 헤더 파싱
+                                let mut headers = [httparse::EMPTY_HEADER; 64];
+                                let mut resp = httparse::Response::new(&mut headers);
+                                if let Ok(_) = resp.parse(&resp_bytes[..headers_end_pos]) {
+                                    // Content-Length 또는 Transfer-Encoding 찾기
                                     let mut content_length = None;
-                                    let is_chunked = headers.contains("transfer-encoding: chunked");
+                                    let mut is_chunked = false;
                                     
-                                    // Content-Length 헤더 값 추출
-                                    if !is_chunked {
-                                        for line in headers.lines() {
-                                            if line.starts_with("content-length:") {
-                                                if let Some(len_str) = line.split(':').nth(1) {
-                                                    if let Ok(len) = len_str.trim().parse::<usize>() {
-                                                        content_length = Some(len);
-                                                        break;
-                                                    }
+                                    for header in headers.iter() {
+                                        if header.name.is_empty() {
+                                            break;
+                                        }
+                                        
+                                        if header.name.eq_ignore_ascii_case("content-length") {
+                                            if let Ok(len_str) = std::str::from_utf8(header.value) {
+                                                if let Ok(len) = len_str.trim().parse::<usize>() {
+                                                    content_length = Some(len);
                                                 }
+                                            }
+                                        } else if header.name.eq_ignore_ascii_case("transfer-encoding") {
+                                            if let Ok(value) = std::str::from_utf8(header.value) {
+                                                is_chunked = value.to_lowercase().contains("chunked");
                                             }
                                         }
                                     }
@@ -191,23 +214,20 @@ pub async fn proxy_http_streams(
                                     // 응답 완료 확인
                                     if is_chunked {
                                         // chunked 인코딩의 경우 마지막 청크 패턴 확인
-                                        if resp_str.contains("\r\n0\r\n\r\n") {
+                                        if chunk_searcher.search_in(resp_bytes).is_some() {
                                             response_completed = true;
                                             debug!("[Session:{}] Chunked 응답 완료 감지, 요청 #{}", session_id, current_response_for);
                                         }
                                     } else if let Some(len) = content_length {
                                         // Content-Length가 있는 경우, 헤더 끝 이후의 본문 길이 확인
-                                        if parts.len() > 1 {
-                                            let body = parts[1];
-                                            if body.len() >= len {
-                                                response_completed = true;
-                                                debug!("[Session:{}] Content-Length 응답 완료 감지, 요청 #{}, 길이: {}", 
-                                                      session_id, current_response_for, len);
-                                            }
+                                        let body_length = resp_bytes.len() - headers_end_pos;
+                                        if body_length >= len {
+                                            response_completed = true;
+                                            debug!("[Session:{}] Content-Length 응답 완료 감지, 요청 #{}, 길이: {}", 
+                                                  session_id, current_response_for, len);
                                         }
                                     } else {
                                         // Content-Length도 없고 chunked도 아닌 경우, 헤더 수신 후 즉시 응답 완료로 처리
-                                        // (HTTP/1.0 또는 헤더만 있는 응답)
                                         response_completed = true;
                                         debug!("[Session:{}] 헤더 전용 응답 완료 감지, 요청 #{}", session_id, current_response_for);
                                     }
