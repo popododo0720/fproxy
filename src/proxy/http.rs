@@ -16,6 +16,7 @@ use libc;
 
 use crate::metrics::Metrics;
 use crate::constants::*;
+use crate::REQUEST_LOGGER;
 
 /// HTTP 스트림 간에 데이터를 전달하고 검사합니다
 pub async fn proxy_http_streams(
@@ -25,10 +26,32 @@ pub async fn proxy_http_streams(
     session_id: &str,
     request_start_time: Instant,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    // 클라이언트 IP 주소 가져오기
+    let client_ip = client_stream.peer_addr()
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_else(|_| "Unknown IP".to_string());
+    
+    // 서버 IP 주소 가져오기
+    let server_ip = server_stream.peer_addr()
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_else(|_| "Unknown IP".to_string());
+    
+    // Linux에서만 splice 사용 시도
+    #[cfg(target_os = "linux")]
     if USE_SPLICE {
-        return proxy_http_streams_splice(client_stream, server_stream, metrics, session_id, request_start_time).await;
+        debug!("[Session:{}] Attempting to use kernel splice for HTTP streams", session_id);
+        match proxy_http_streams_splice(client_stream, server_stream, Arc::clone(&metrics), session_id, request_start_time, client_ip.clone(), server_ip.clone()).await {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                warn!("[Session:{}] Splice mode failed, falling back to standard mode: {}", session_id, e);
+                // splice 실패 시 표준 모드로 폴백
+                // 새 연결을 생성해야 함
+                return Err(e);
+            }
+        }
     }
 
+    debug!("[Session:{}] Using standard mode for HTTP streams", session_id);
     let (mut client_read, mut client_write) = tokio::io::split(client_stream);
     let (mut server_read, mut server_write) = tokio::io::split(server_stream);
     
@@ -38,6 +61,10 @@ pub async fn proxy_http_streams(
     // HTTP 요청 감지 상태
     let parsing_request = Arc::new(RwLock::new(false));
     let current_request_id = Arc::new(RwLock::new(0_u64));
+    
+    // 클라이언트 IP와 서버 IP 저장
+    let _client_ip_clone = client_ip.clone();
+    let _server_ip_clone = server_ip.clone();
     
     // 패턴 상수 정의
     let header_end = b"\r\n\r\n";
@@ -49,6 +76,8 @@ pub async fn proxy_http_streams(
         let parsing_request = Arc::clone(&parsing_request);
         let current_request_id = Arc::clone(&current_request_id);
         let metrics_clone = Arc::clone(&metrics);
+        let _client_ip = _client_ip_clone.clone();
+        let _server_ip = _server_ip_clone.clone();
         
         async move {
             let mut total_bytes = 0u64;
@@ -81,6 +110,33 @@ pub async fn proxy_http_streams(
                                             debug!("[Session:{}] 새 HTTP 요청 #{} 감지: {} {}", 
                                                   session_id, request_id, method, req.path.unwrap_or(""));
                                             
+                                            // DB에 요청 로깅
+                                            if let Ok(logger) = REQUEST_LOGGER.try_read() {
+                                                let path = req.path.unwrap_or("");
+                                                let headers_str = req_buffer.iter().map(|&c| c as char).collect::<String>();
+                                                
+                                                // 호스트 헤더 추출
+                                                let host = headers.iter()
+                                                    .find(|h| h.name.eq_ignore_ascii_case("Host"))
+                                                    .and_then(|h| std::str::from_utf8(h.value).ok())
+                                                    .unwrap_or("unknown_host");
+                                                
+                                                if let Err(e) = logger.log_async(
+                                                    host,
+                                                    method,
+                                                    path,
+                                                    &headers_str,
+                                                    None, // 바디는 나중에 처리
+                                                    session_id,
+                                                    &_client_ip, // 클라이언트 IP 추가
+                                                    &_server_ip, // 서버 IP 추가
+                                                    None,
+                                                    false
+                                                ) {
+                                                    warn!("[Session:{}] HTTP 요청 로깅 실패: {}", session_id, e);
+                                                }
+                                            }
+                                            
                                             req_buffer.clear();
                                             req_buffer.put_slice(&buffer);
                                         }
@@ -107,12 +163,6 @@ pub async fn proxy_http_streams(
                         // 메트릭스 업데이트 (실시간)
                         total_bytes += n as u64;
                         metrics_clone.add_http_bytes_in(n as u64);
-                        
-                        // 주기적으로 로그 출력 (1MB 마다)
-                        if total_bytes % (1024 * 1024) < (n as u64) {
-                            debug!("[Session:{}] HTTP 클라이언트→서버 누적: {} KB", 
-                                   session_id, total_bytes / 1024);
-                        }
                     },
                     Err(e) => {
                         error!("[Session:{}] Error reading from client: {}", session_id, e);
@@ -131,6 +181,8 @@ pub async fn proxy_http_streams(
         let parsing_request = Arc::clone(&parsing_request);
         let current_request_id = Arc::clone(&current_request_id);
         let metrics_clone = Arc::clone(&metrics);
+        let _client_ip = _client_ip_clone.clone();
+        let _server_ip = _server_ip_clone.clone();
         
         async move {
             let mut total_bytes = 0u64;
@@ -226,24 +278,40 @@ pub async fn proxy_http_streams(
                                         debug!("[Session:{}] 헤더 전용 응답 완료 감지, 요청 #{}", session_id, current_response_for);
                                     }
                                     
+                                    // 응답 완료 감지 시 처리
                                     if response_completed {
-                                        // 응답 시간 계산
-                                        let mut times = request_times.write().unwrap();
-                                        if let Some(start_time) = times.remove(&current_response_for) {
-                                            let response_time = start_time.elapsed().as_millis() as u64;
+                                        // 응답 시간 측정 및 기록
+                                        if let Some(start_time) = request_times.write().unwrap().remove(&current_response_for) {
+                                            let duration = start_time.elapsed();
+                                            let duration_ms = duration.as_millis() as u64;
                                             
-                                            metrics_clone.update_response_time_stats(response_time);
+                                            // 응답 시간 메트릭 업데이트
+                                            metrics_clone.update_response_time_stats(duration_ms);
                                             
-                                            info!("[Session:{}] HTTP 요청 #{} 완료, 응답 시간: {} ms", 
-                                                 session_id, current_response_for, response_time);
-                                            
-                                            *parsing_request.write().unwrap() = false;
-                                        } else {
-                                            warn!("[Session:{}] HTTP 요청 #{} 완료되었으나 시작 시간을 찾을 수 없음", 
-                                                 session_id, current_response_for);
+                                            // 응답 시간 로그 기록
+                                            if let Ok(logger) = REQUEST_LOGGER.try_read() {
+                                                // 여기서는 호스트 정보를 알 수 없으므로 세션 ID만 사용하여 로그 업데이트
+                                                debug!("[Session:{}] HTTP 응답 완료, 요청 #{}, 응답 시간: {}ms", 
+                                                      session_id, current_response_for, duration_ms);
+                                                
+                                                // 응답 시간 업데이트 함수 호출
+                                                tokio::spawn({
+                                                    let logger = logger.clone();
+                                                    let session_id = session_id.to_string();
+                                                    async move {
+                                                        if let Err(e) = logger.update_response_time(&session_id, duration_ms).await {
+                                                            debug!("[Session:{}] 응답 시간 업데이트 실패: {}", session_id, e);
+                                                        }
+                                                    }
+                                                });
+                                            }
                                         }
                                         
                                         is_reading_response = false;
+                                        resp_buffer.clear();
+                                        
+                                        // 요청 처리 상태 초기화
+                                        *parsing_request.write().unwrap() = false;
                                     }
                                 }
                             }
@@ -296,30 +364,58 @@ async fn proxy_http_streams_splice(
     metrics: Arc<Metrics>,
     session_id: &str,
     request_start_time: Instant,
+    client_ip: String,
+    server_ip: String,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     debug!("[Session:{}] Using kernel splice for HTTP streams", session_id);
     
     // TCP 소켓 최적화 - 네이글 알고리즘 비활성화 및 퀵 ACK 활성화
-    set_tcp_socket_options(&client_stream, &server_stream)?;
+    set_tcp_socket_options(&client_stream, &server_stream).map_err(|e| {
+        error!("[Session:{}] Failed to set TCP socket options: {}", session_id, e);
+        e
+    })?;
     
     // 클라이언트와 서버 파일 디스크립터 가져오기
     let client_fd = client_stream.as_raw_fd();
     let server_fd = server_stream.as_raw_fd();
     
     // 클라이언트->서버, 서버->클라이언트 각각의 파이프 생성 - 비동기적 파이프 생성
-    let (pipe_c2s_read, pipe_c2s_write) = create_nonblocking_pipe()?;
-    let (pipe_s2c_read, pipe_s2c_write) = create_nonblocking_pipe()?;
+    let (pipe_c2s_read, pipe_c2s_write) = create_nonblocking_pipe().map_err(|e| {
+        error!("[Session:{}] Failed to create client->server pipe: {}", session_id, e);
+        e
+    })?;
+    let (pipe_s2c_read, pipe_s2c_write) = create_nonblocking_pipe().map_err(|e| {
+        error!("[Session:{}] Failed to create server->client pipe: {}", session_id, e);
+        // 첫 번째 파이프 정리
+        let _ = close(pipe_c2s_read);
+        let _ = close(pipe_c2s_write);
+        e
+    })?;
     
     // 소켓 버퍼 사이즈 최적화
-    optimize_socket_buffers(client_fd, server_fd)?;
+    optimize_socket_buffers(client_fd, server_fd).map_err(|e| {
+        error!("[Session:{}] Failed to optimize socket buffers: {}", session_id, e);
+        // 파이프 정리
+        let _ = close(pipe_c2s_read);
+        let _ = close(pipe_c2s_write);
+        let _ = close(pipe_s2c_read);
+        let _ = close(pipe_s2c_write);
+        e
+    })?;
     
     // 새로운 스레드에서 데이터 전송을 처리 (tokio worker 스레드에서 블로킹 호출을 피하기 위함)
     let metrics_clone = Arc::clone(&metrics);
     let session_id_clone = session_id.to_string();
+    let client_ip_clone = client_ip.clone();
+    let server_ip_clone = server_ip.clone();
     
     let client_to_server_handle = std::thread::spawn(move || {
         let mut total_bytes = 0u64;
         let mut max_splice_size = BUFFER_SIZE_SMALL; // 초기 크기
+        
+        // HTTP 요청 감지를 위한 버퍼
+        let _req_buffer: Vec<u8> = Vec::with_capacity(BUFFER_SIZE_SMALL);
+        let _is_parsing_request = false;
         
         loop {
             // 클라이언트로부터 파이프로 데이터 전송
@@ -342,6 +438,56 @@ async fn proxy_http_streams_splice(
                 match nix::unistd::read(client_fd, &mut buffer) {
                     Ok(n) if n > 0 => {
                         buffer.truncate(n);
+                        
+                        // HTTP 요청 감지를 위해 버퍼에 데이터 추가
+                        if !_is_parsing_request && _req_buffer.len() < BUFFER_SIZE_SMALL {
+                            _req_buffer.extend_from_slice(&buffer);
+                            
+                            // HTTP 요청 헤더 파싱 시도
+                            let mut headers = [httparse::EMPTY_HEADER; 64];
+                            let mut req = httparse::Request::new(&mut headers);
+                            
+                            if let Ok(status) = req.parse(&_req_buffer) {
+                                if status.is_partial() || status.is_complete() {
+                                    if let Some(method) = req.method {
+                                        if let Some(path) = req.path {
+                                            debug!("[Session:{}] HTTP 요청 감지 (splice): {} {}", 
+                                                  session_id_clone, method, path);
+                                            
+                                            // 호스트 헤더 추출
+                                            let host = headers.iter()
+                                                .find(|h| h.name.eq_ignore_ascii_case("Host"))
+                                                .and_then(|h| std::str::from_utf8(h.value).ok())
+                                                .unwrap_or("unknown_host");
+                                            
+                                            // DB에 요청 로깅
+                                            if let Ok(logger) = REQUEST_LOGGER.try_read() {
+                                                let headers_str = String::from_utf8_lossy(&_req_buffer).to_string();
+                                                
+                                                if let Err(e) = logger.log_async(
+                                                    host,
+                                                    method,
+                                                    path,
+                                                    &headers_str,
+                                                    None,
+                                                    &session_id_clone,
+                                                    &client_ip_clone, // 클라이언트 IP 추가
+                                                    &server_ip_clone, // 서버 IP 추가
+                                                    None,
+                                                    false
+                                                ) {
+                                                    warn!("[Session:{}] HTTP 요청 로깅 실패 (splice): {}", 
+                                                         session_id_clone, e);
+                                                }
+                                            }
+                                            
+                                            _is_parsing_request = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        
                         match nix::unistd::write(pipe_c2s_write, &buffer) {
                             Ok(m) => m as isize,
                             Err(_) => -1
@@ -472,7 +618,7 @@ async fn proxy_http_streams_splice(
                                 std::thread::sleep(std::time::Duration::from_millis(1));
                                 continue;
                             }
-                            error!("[Session:{}] Failed to splice to server", session_id_clone);
+                            error!("[Session:{}] Failed to splice from client", session_id_clone);
                             break;
                         },
                         _ => {
@@ -487,7 +633,9 @@ async fn proxy_http_streams_splice(
                         std::thread::sleep(std::time::Duration::from_millis(1));
                         continue;
                     }
-                    error!("[Session:{}] Failed to splice from client", session_id_clone);
+                    let err = std::io::Error::last_os_error();
+                    error!("[Session:{}] Failed to splice from client: {} (code: {:?})", 
+                           session_id_clone, err, err.raw_os_error());
                     break;
                 },
                 _ => {
@@ -514,6 +662,10 @@ async fn proxy_http_streams_splice(
         let mut total_bytes = 0u64;
         let mut max_splice_size = BUFFER_SIZE_SMALL; // 초기 크기
         
+        // HTTP 응답 감지를 위한 버퍼
+        let _resp_buffer: Vec<u8> = Vec::with_capacity(BUFFER_SIZE_SMALL);
+        let _is_parsing_response = false;
+        
         loop {
             // 서버로부터 파이프로 데이터 전송
             #[cfg(target_os = "linux")]
@@ -535,6 +687,38 @@ async fn proxy_http_streams_splice(
                 match nix::unistd::read(server_fd, &mut buffer) {
                     Ok(n) if n > 0 => {
                         buffer.truncate(n);
+                        
+                        // HTTP 응답 감지를 위해 버퍼에 데이터 추가
+                        if !_is_parsing_response && _resp_buffer.len() < BUFFER_SIZE_SMALL {
+                            _resp_buffer.extend_from_slice(&buffer);
+                            
+                            // HTTP 응답 헤더 파싱 시도
+                            let mut headers = [httparse::EMPTY_HEADER; 64];
+                            let mut resp = httparse::Response::new(&mut headers);
+                            
+                            if let Ok(status) = resp.parse(&_resp_buffer) {
+                                if status.is_partial() || status.is_complete() {
+                                    debug!("[Session:{}] HTTP 응답 감지 (splice): 상태 코드 {}", 
+                                          session_id_clone, resp.code.unwrap_or(0));
+                                    
+                                    // 응답 시간 계산 및 업데이트
+                                    let now = Instant::now();
+                                    let response_time = now.duration_since(request_start_time).as_millis() as u64;
+                                    
+                                    // DB에 응답 시간 업데이트
+                                    tokio::spawn(async move {
+                                        if let Ok(logger) = REQUEST_LOGGER.read().await {
+                                            if let Err(e) = logger.update_response_time(&session_id_clone, response_time).await {
+                                                warn!("[Session:{}] 응답 시간 업데이트 실패 (splice): {}", session_id_clone, e);
+                                            }
+                                        }
+                                    });
+                                    
+                                    _is_parsing_response = true;
+                                }
+                            }
+                        }
+                        
                         match nix::unistd::write(pipe_s2c_write, &buffer) {
                             Ok(m) => m as isize,
                             Err(_) => -1
@@ -659,7 +843,9 @@ async fn proxy_http_streams_splice(
                                 std::thread::sleep(std::time::Duration::from_millis(1));
                                 continue;
                             }
-                            error!("[Session:{}] Failed to splice to client", session_id_clone);
+                            let err = std::io::Error::last_os_error();
+                            error!("[Session:{}] Failed to splice from server: {} (code: {:?})", 
+                                   session_id_clone, err, err.raw_os_error());
                             break;
                         },
                         _ => {
@@ -712,23 +898,53 @@ async fn proxy_http_streams_splice(
 fn create_nonblocking_pipe() -> Result<(RawFd, RawFd), io::Error> {
     // 파이프 생성
     let (read_fd, write_fd) = pipe().map_err(|e| {
+        error!("Failed to create pipe: {}", e);
         io::Error::new(io::ErrorKind::Other, format!("Failed to create pipe: {}", e))
     })?;
+    
+    // 파이프 버퍼 크기 최적화 (Linux 전용)
+    #[cfg(target_os = "linux")]
+    {
+        // 파이프 버퍼 크기 가져오기
+        let mut pipe_size: libc::c_int = 0;
+        unsafe {
+            let read_fd_raw = read_fd.as_raw_fd();
+            if libc::fcntl(read_fd_raw, libc::F_GETPIPE_SZ, &mut pipe_size) >= 0 {
+                debug!("Current pipe buffer size: {} bytes", pipe_size);
+                
+                // 파이프 버퍼 크기 증가 (최대 1MB)
+                let target_size = BUFFER_SIZE_MEDIUM as libc::c_int;
+                if pipe_size < target_size {
+                    if libc::fcntl(read_fd_raw, libc::F_SETPIPE_SZ, target_size) >= 0 {
+                        debug!("Increased pipe buffer size to {} bytes", target_size);
+                    }
+                    let write_fd_raw = write_fd.as_raw_fd();
+                    if libc::fcntl(write_fd_raw, libc::F_SETPIPE_SZ, target_size) >= 0 {
+                        debug!("Increased pipe buffer size to {} bytes", target_size);
+                    }
+                }
+            }
+        }
+    }
     
     // 읽기 파이프를 비동기적으로 설정 (libc 직접 사용)
     let read_fd_raw = read_fd.as_raw_fd();
     unsafe {
         let flags = libc::fcntl(read_fd_raw, libc::F_GETFL);
         if flags < 0 {
+            let err = io::Error::last_os_error();
+            error!("Failed to get flags for read pipe: {} (code: {:?})", err, err.raw_os_error());
             let _ = close(read_fd);
             let _ = close(write_fd);
-            return Err(io::Error::last_os_error());
+            return Err(err);
         }
         
         if libc::fcntl(read_fd_raw, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            let err = io::Error::last_os_error();
+            error!("Failed to set nonblocking for read pipe: {} (code: {:?})", err, err.raw_os_error());
             let _ = close(read_fd);
             let _ = close(write_fd);
-            return Err(io::Error::last_os_error());
+            return Err(err);
         }
     }
     
@@ -737,15 +953,19 @@ fn create_nonblocking_pipe() -> Result<(RawFd, RawFd), io::Error> {
     unsafe {
         let flags = libc::fcntl(write_fd_raw, libc::F_GETFL);
         if flags < 0 {
+            let err = io::Error::last_os_error();
+            error!("Failed to get flags for write pipe: {} (code: {:?})", err, err.raw_os_error());
             let _ = close(read_fd);
             let _ = close(write_fd);
-            return Err(io::Error::last_os_error());
+            return Err(err);
         }
         
         if libc::fcntl(write_fd_raw, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            let err = io::Error::last_os_error();
+            error!("Failed to set nonblocking for write pipe: {} (code: {:?})", err, err.raw_os_error());
             let _ = close(read_fd);
             let _ = close(write_fd);
-            return Err(io::Error::last_os_error());
+            return Err(err);
         }
     }
     
@@ -860,4 +1080,6 @@ fn optimize_socket_buffers(client_fd: RawFd, server_fd: RawFd) -> Result<(), io:
 /// EAGAIN/EWOULDBLOCK 오류인지 확인
 fn is_would_block_error(err: io::Error) -> bool {
     err.kind() == io::ErrorKind::WouldBlock
+        || err.raw_os_error() == Some(libc::EAGAIN)
+        || err.raw_os_error() == Some(libc::EWOULDBLOCK)
 } 

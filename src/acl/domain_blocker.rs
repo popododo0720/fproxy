@@ -11,9 +11,8 @@ use crate::constants::ACL_CACHE_SIZE;
 /// 도메인 매칭 결과를 나타내는 열거형
 #[derive(Debug, Clone)]
 enum MatchResult {
-    ExactMatch(String),
-    WildcardMatch(String, String),
-    NoMatch,
+    Blocked,
+    NotBlocked,
 }
 
 // 도메인 차단 결과 캐시
@@ -40,36 +39,32 @@ impl DomainBlocker {
         
         // 캐시에서 결과 확인
         if let Some(result) = self.check_cache(&host_lower) {
-            match &result {
-                MatchResult::ExactMatch(domain) => {
-                    info!("캐시된 차단 도메인 감지 (정확히 일치): {}", domain);
+            match result {
+                MatchResult::Blocked => {
+                    info!("캐시된 차단 도메인 감지: {}", host_lower);
                     return true;
                 },
-                MatchResult::WildcardMatch(pattern, domain) => {
-                    info!("캐시된 차단 도메인 감지 (와일드카드 패턴 {} 일치): {}", pattern, domain);
-                    return true;
-                },
-                MatchResult::NoMatch => return false,
+                MatchResult::NotBlocked => return false,
             }
         }
         
-        // 도메인 매칭 시도
-        let result = self.match_domain(&host_lower);
+        // 도메인 매칭 시도 - Config의 is_domain_blocked 메서드 활용
+        let is_blocked = self.config.is_domain_blocked(&host_lower);
         
         // 결과를 캐시에 저장
-        self.update_cache(&host_lower, result.clone());
+        let result = if is_blocked {
+            MatchResult::Blocked
+        } else {
+            MatchResult::NotBlocked
+        };
         
-        match result {
-            MatchResult::ExactMatch(domain) => {
-                info!("차단된 도메인 감지 (정확히 일치): {}", domain);
-                true
-            },
-            MatchResult::WildcardMatch(pattern, domain) => {
-                info!("차단된 도메인 감지 (와일드카드 패턴 {} 일치): {}", pattern, domain);
-                true
-            },
-            MatchResult::NoMatch => false,
+        self.update_cache(&host_lower, result);
+        
+        if is_blocked {
+            info!("차단된 도메인 감지: {}", host_lower);
         }
+        
+        is_blocked
     }
     
     /// 캐시에서 도메인 차단 결과 확인
@@ -85,33 +80,6 @@ impl DomainBlocker {
         if let Ok(mut cache) = DOMAIN_BLOCK_CACHE.write() {
             cache.put(host.to_string(), result);
         }
-    }
-    
-    /// 도메인 매칭 함수
-    fn match_domain(&self, host: &str) -> MatchResult {
-        // 1. 정확한 도메인 매칭 시도
-        if self.config.blocked_domains.contains(host) {
-            return MatchResult::ExactMatch(host.to_string());
-        }
-        
-        // 2. 와일드카드 패턴 매칭 시도
-        if let Some(pattern) = self.match_wildcard_pattern(host) {
-            return MatchResult::WildcardMatch(pattern, host.to_string());
-        }
-        
-        MatchResult::NoMatch
-    }
-    
-    /// 와일드카드 패턴 매칭
-    fn match_wildcard_pattern(&self, host: &str) -> Option<String> {
-        self.config.blocked_patterns
-            .iter()
-            .filter(|pattern| pattern.starts_with("*."))
-            .find(|pattern| {
-                let domain_suffix = &pattern[1..]; // "*.example.com" -> ".example.com"
-                host.ends_with(domain_suffix)
-            })
-            .map(|pattern| pattern.to_string())
     }
     
     // /// 차단된 요청을 로깅

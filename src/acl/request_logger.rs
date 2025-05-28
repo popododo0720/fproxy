@@ -1,31 +1,41 @@
-use log::{debug, error, info};
-use tokio::io::AsyncWriteExt;
-use tokio::fs::File;
+use log::{debug, error, info, warn};
 use tokio::sync::mpsc::{self, Sender, Receiver};
 use tokio::time::{sleep, Duration as TokioDuration};
 use std::collections::{VecDeque, HashMap};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 use std::borrow::Cow;
-use chrono::{Local, Datelike};
-use rayon::prelude::*;
+use std::error::Error;
+use chrono::{DateTime, Utc, Datelike};
+use smallvec::SmallVec;
 
 use crate::constants::*;
-use crate::metrics::Metrics;
+use crate::db;
 
 // 최대 최근 응답 시간 저장 개수
 const MAX_RECENT_RESPONSES: usize = 1000;
 
 // 로그 배치 크기 및 플러시 간격
-const LOG_BATCH_SIZE: usize = 100;
-const LOG_FLUSH_INTERVAL_MS: u64 = 5000; // 5초마다 로그 플러시
+const LOG_BATCH_SIZE: usize = 1000;
+const LOG_FLUSH_INTERVAL_MS: u64 = 200; // 0.2초마다 로그 플러시
 const LOG_CHANNEL_SIZE: usize = 10000;    // 로그 채널 크기
 
 /// 로그 메시지 타입
 #[derive(Debug)]
 pub enum LogMessage {
-    RequestLog { content: String, host: String },
-    RejectLog { content: String, host: String, ip: String },
+    RequestLog { 
+        host: String,
+        method: String,
+        path: String, 
+        header: String,
+        body: Option<String>,
+        timestamp: DateTime<Utc>, 
+        session_id: String,
+        client_ip: String,
+        target_ip: String,
+        response_time: Option<u64>,
+        is_rejected: bool
+    },
     FlushLogs,
 }
 
@@ -33,7 +43,7 @@ pub enum LogMessage {
 #[derive(Debug, Clone, Copy)]
 struct ResponseTimeInfo {
     timestamp: SystemTime,
-    duration_ms: u64,
+    response_time: u64,
 }
 
 /// 응답 시간 메트릭을 저장하는 구조체
@@ -78,7 +88,7 @@ impl ResponseMetrics {
         // 최근 응답 시간 추가
         self.recent_responses.push_back(ResponseTimeInfo {
             timestamp: SystemTime::now(),
-            duration_ms,
+            response_time: duration_ms,
         });
     }
     
@@ -107,51 +117,123 @@ impl ResponseMetrics {
 /// 로그 배치 구조체
 #[derive(Default)]
 struct LogBatch {
-    entries: Vec<String>,
+    request_logs: Vec<(String, String, String, String, Option<String>, DateTime<Utc>, String, String, String, Option<u64>, bool)>, // host, method, path, header, body, timestamp, session_id, client_ip, target_ip, response_time, is_rejected
     size: usize,
 }
 
 impl LogBatch {
     fn new() -> Self {
         Self {
-            entries: Vec::with_capacity(LOG_BATCH_SIZE),
+            request_logs: Vec::with_capacity(LOG_BATCH_SIZE),
             size: 0,
         }
     }
     
-    fn add(&mut self, entry: String) {
-        self.size += entry.len();
-        self.entries.push(entry);
+    fn add_request(&mut self, host: String, method: String, path: String, header: String, body: Option<String>, timestamp: DateTime<Utc>, session_id: String, client_ip: String, target_ip: String, response_time: Option<u64>, is_rejected: bool) {
+        // 크기 계산 (헤더와 바디 크기 합산)
+        let content_size = header.len() + body.as_ref().map_or(0, |b| b.len());
+        self.size += content_size;
+        self.request_logs.push((host, method, path, header, body, timestamp, session_id, client_ip, target_ip, response_time, is_rejected));
     }
     
     fn should_flush(&self) -> bool {
-        self.entries.len() >= LOG_BATCH_SIZE || self.size >= BUFFER_SIZE_MEDIUM
+        self.request_logs.len() >= LOG_BATCH_SIZE || self.size >= BUFFER_SIZE_MEDIUM
     }
     
     fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.request_logs.is_empty()
     }
     
     fn clear(&mut self) {
-        self.entries.clear();
+        self.request_logs.clear();
         self.size = 0;
+    }
+
+    // 배치 쿼리 생성 메서드
+    fn create_batch_query(&self) -> (String, Vec<Box<dyn tokio_postgres::types::ToSql + Send + Sync + 'static>>) {
+        let mut query = "INSERT INTO request_logs (host, method, path, header, body, timestamp, session_id, client_ip, target_ip, response_time, is_rejected) VALUES ".to_string();
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Send + Sync + 'static>> = Vec::new();
+        
+        for (i, (host, method, path, header, body, timestamp, session_id, client_ip, target_ip, response_time, is_rejected)) in self.request_logs.iter().enumerate() {
+            if i > 0 {
+                query.push_str(", ");
+            }
+            
+            let start_idx = i * 11 + 1;
+            query.push_str(&format!("(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                start_idx, start_idx + 1, start_idx + 2, start_idx + 3, start_idx + 4,
+                start_idx + 5, start_idx + 6, start_idx + 7, start_idx + 8, start_idx + 9, start_idx + 10));
+            
+            params.push(Box::new(host.clone()));
+            params.push(Box::new(method.clone()));
+            params.push(Box::new(path.clone()));
+            params.push(Box::new(header.clone()));
+            
+            match body {
+                Some(b) => params.push(Box::new(b.clone())),
+                None => params.push(Box::new(Option::<String>::None)),
+            }
+            
+            params.push(Box::new(*timestamp));
+            params.push(Box::new(session_id.clone()));
+            params.push(Box::new(client_ip.clone()));
+            params.push(Box::new(target_ip.clone()));
+            
+            let rt_i64 = response_time.map(|rt| rt as i64);
+            params.push(Box::new(rt_i64));
+            params.push(Box::new(*is_rejected));
+        }
+        
+        (query, params)
+    }
+    
+    // 단일 로그 항목에 대한 쿼리 생성
+    fn create_single_query() -> String {
+        "INSERT INTO request_logs (host, method, path, header, body, timestamp, session_id, client_ip, target_ip, response_time, is_rejected) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)".to_string()
+    }
+    
+    // 단일 로그 항목에 대한 파라미터 생성
+    fn create_single_params(&self, index: usize) -> Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> {
+        if let Some((host, method, path, header, body, timestamp, session_id, client_ip, target_ip, response_time, is_rejected)) = self.request_logs.get(index) {
+            let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::with_capacity(11);
+            
+            params.push(Box::new(host.clone()));
+            params.push(Box::new(method.clone()));
+            params.push(Box::new(path.clone()));
+            params.push(Box::new(header.clone()));
+            params.push(Box::new(body.clone()));
+            params.push(Box::new(*timestamp));
+            params.push(Box::new(session_id.clone()));
+            params.push(Box::new(client_ip.clone()));
+            params.push(Box::new(target_ip.clone()));
+            
+            // 응답 시간은 Option<u64>를 Option<i64>로 변환
+            let rt_i64 = response_time.map(|rt| rt as i64);
+            params.push(Box::new(rt_i64));
+            
+            params.push(Box::new(*is_rejected));
+            
+            params
+        } else {
+            vec![]
+        }
     }
 }
 
 /// TLS 요청 로깅을 담당하는 구조체
+#[derive(Clone)]
 pub struct RequestLogger {
-    metrics: Arc<RwLock<ResponseMetrics>>,
     request_start_times: Arc<RwLock<HashMap<String, Instant>>>,
     log_sender: Option<Sender<LogMessage>>,
-    global_metrics: Arc<Metrics>,
 }
 
 /// HTTP 요청 파싱 결과
 #[derive(Debug)]
 enum ParseResult {
     Complete {
-        request_line: String,
-        headers: Vec<String>,
+        method: String,
+        path: String,
+        header: SmallVec<[String; 16]>,
         body: Option<String>,
         duration_ms: Option<u64>,
     },
@@ -163,488 +245,445 @@ impl RequestLogger {
     /// 새 RequestLogger 인스턴스 생성
     pub fn new() -> Self {
         RequestLogger {
-            metrics: Arc::new(RwLock::new(ResponseMetrics::new())),
-            request_start_times: Arc::new(RwLock::new(HashMap::new())),
+            request_start_times: Arc::new(RwLock::new(HashMap::with_capacity(128))),
             log_sender: None,
-            global_metrics: Metrics::new(),
         }
     }
     
     /// 로그 작성기 초기화
-    pub async fn init(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // 로그 디렉터리 생성
-        tokio::fs::create_dir_all("logs").await?;
+    pub async fn init(&mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        debug!("RequestLogger 초기화 시작...");
+        
+        // 파티션 관리 확인
+        debug!("데이터베이스 파티션 확인 중...");
+        match db::ensure_partitions().await {
+            Ok(_) => debug!("데이터베이스 파티션 확인 완료"),
+            Err(e) => {
+                warn!("데이터베이스 파티션 확인 실패: {}. 계속 진행합니다.", e);
+                // 파티션 확인 실패해도 계속 진행
+            }
+        }
+
+        // 직접 테이블 생성 시도 (파티션 관리가 실패했을 경우를 대비)
+        debug!("기본 테이블 존재 여부 확인 중...");
+        if let Err(e) = Self::ensure_base_tables().await {
+            error!("기본 테이블 생성 실패: {}", e);
+            return Err(e);
+        }
         
         // 채널 생성 - 크기 증가
+        debug!("로그 채널 생성 중... (크기: {})", LOG_CHANNEL_SIZE);
         let (tx, rx) = mpsc::channel::<LogMessage>(LOG_CHANNEL_SIZE);
         self.log_sender = Some(tx.clone());
         
         // 로그 작성 태스크 시작
+        debug!("로그 작성 태스크 시작...");
         tokio::spawn(Self::log_writer_task(rx));
         
         // 주기적 로그 플러시 태스크 시작
+        debug!("주기적 로그 플러시 태스크 시작...");
         tokio::spawn(async move {
             loop {
                 sleep(TokioDuration::from_millis(LOG_FLUSH_INTERVAL_MS)).await;
-                if tx.send(LogMessage::FlushLogs).await.is_err() {
-                    break;
+                match tx.send(LogMessage::FlushLogs).await {
+                    Ok(_) => debug!("로그 플러시 명령 전송 성공"),
+                    Err(e) => {
+                        error!("로그 플러시 명령 전송 실패: {}", e);
+                        break;
+                    }
                 }
             }
         });
         
-        info!("RequestLogger initialized with async logging and batching");
+        info!("RequestLogger 초기화 완료: PostgreSQL 로깅 및 배치 처리 활성화됨");
         Ok(())
     }
     
     /// 로그 작성 태스크
     async fn log_writer_task(mut rx: Receiver<LogMessage>) {
-        let mut file_cache: HashMap<String, File> = HashMap::new();
-        
-        // 로그 배치 맵
-        let mut log_batches: HashMap<String, LogBatch> = HashMap::new();
+        let mut log_batch = LogBatch::new();
         
         while let Some(message) = rx.recv().await {
             match message {
-                LogMessage::RequestLog { content, host } => {
-                    // 배치에 추가
-                    let batch = log_batches.entry(host.clone()).or_insert_with(LogBatch::new);
-                    batch.add(format!("{}\n\n", content));
+                LogMessage::RequestLog { host, method, path, header, body, timestamp, session_id, client_ip, target_ip, response_time, is_rejected } => {
+                    log_batch.add_request(host, method, path, header, body, timestamp, session_id, client_ip, target_ip, response_time, is_rejected);
                     
-                    // 배치가 충분히 크면 플러시
-                    if batch.should_flush() {
-                        Self::flush_log_batch(&mut file_cache, &host, batch).await;
-                    }
-                },
-                LogMessage::RejectLog { content, host, ip } => {
-                    // 차단 로그 파일 이름 생성
-                    let today = Local::now();
-                    let date_str = format!("{:04}{:02}{:02}", 
-                        today.year(), today.month(), today.day());
-                    let log_key = format!("{}_{}_reject", host, date_str);
-                    
-                    // IP 정보와 함께 로그 작성
-                    let log_content = format!("# IP: {}\n{}\n\n", ip, content);
-                    
-                    // 배치에 추가
-                    let batch = log_batches.entry(log_key.clone()).or_insert_with(LogBatch::new);
-                    batch.add(log_content);
-                    
-                    // 배치가 충분히 크면 플러시
-                    if batch.should_flush() {
-                        Self::flush_log_batch(&mut file_cache, &log_key, batch).await;
+                    if log_batch.should_flush() {
+                        if let Err(e) = Self::flush_log_batch(&mut log_batch).await {
+                            error!("로그 배치 플러시 실패: {}", e);
+                        }
                     }
                 },
                 LogMessage::FlushLogs => {
-                    // 모든 배치 플러시
-                    for (host, batch) in log_batches.iter_mut() {
-                        if !batch.is_empty() {
-                            Self::flush_log_batch(&mut file_cache, host, batch).await;
+                    if !log_batch.is_empty() {
+                        if let Err(e) = Self::flush_log_batch(&mut log_batch).await {
+                            error!("로그 배치 플러시 실패: {}", e);
                         }
                     }
                 }
             }
         }
         
-        // 채널이 닫히면 남은 배치 모두 플러시
-        for (host, batch) in log_batches.iter_mut() {
-            if !batch.is_empty() {
-                Self::flush_log_batch(&mut file_cache, host, batch).await;
+        // 채널이 닫혔을 때 남은 로그 플러시
+        if !log_batch.is_empty() {
+            if let Err(e) = Self::flush_log_batch(&mut log_batch).await {
+                error!("최종 로그 배치 플러시 실패: {}", e);
             }
         }
     }
     
     /// 로그 배치 플러시
-    async fn flush_log_batch(file_cache: &mut HashMap<String, File>, host: &str, batch: &mut LogBatch) {
-        if batch.is_empty() {
-            return;
-        }
+    async fn flush_log_batch(batch: &mut LogBatch) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let executor = match db::query::QueryExecutor::get_instance().await {
+            Ok(executor) => executor,
+            Err(e) => {
+                warn!("로그 저장을 위한 쿼리 실행기 가져오기 실패: {}", e);
+                // 로그 배치 삭제하고 계속 진행
+                batch.clear();
+                return Ok(());
+            }
+        };
         
-        // 파일이 없으면 생성
-        if !file_cache.contains_key(host) {
-            let is_reject = host.contains("_reject");
-            let log_path = if is_reject {
-                format!("logs/request_{}.log", host.split('_').next().unwrap_or(host))
-            } else {
-                let today = Local::now();
-                let date_str = format!("{:04}{:02}{:02}", today.year(), today.month(), today.day());
-                format!("logs/request_{}_{}.log", host, date_str)
-            };
+        // 요청 로그 플러시
+        if !batch.request_logs.is_empty() {
+            debug!("배치 쿼리로 {} 개의 로그 삽입 시도", batch.request_logs.len());
             
-            match tokio::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_path)
-                .await {
-                    Ok(file) => {
-                        file_cache.insert(host.to_string(), file);
-                    },
-                    Err(e) => {
-                        error!("Failed to open log file for {}: {}", host, e);
-                        batch.clear();
-                        return;
+            // 배치 쿼리 및 파라미터 생성
+            let (query, params) = batch.create_batch_query();
+            
+            // 파라미터 참조 벡터 생성
+            let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params.iter()
+                .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+                .collect();
+            
+            // 배치 쿼리 실행
+            match executor.execute_query(&query, &param_refs).await {
+                Ok(rows) => {
+                    debug!("배치 쿼리로 {} 개의 로그 삽입 성공", rows);
+                },
+                Err(e) => {
+                    let error_msg = e.to_string();
+                    // 파티션 관련 오류인지 확인
+                    if error_msg.contains("no partition") || error_msg.contains("partition") {
+                        // 파티션 관련 오류 발생 시 개별 삽입으로 폴백
+                        error!("배치 삽입 중 파티션 관련 오류 발생: {}. 개별 삽입으로 전환합니다.", error_msg);
+                        
+                        // 개별 삽입 쿼리 생성
+                        let single_query = LogBatch::create_single_query();
+                        
+                        // 각 로그 항목을 개별적으로 삽입
+                        for i in 0..batch.request_logs.len() {
+                            let boxed_params = batch.create_single_params(i);
+                            
+                            // Box<dyn ToSql + Sync>의 참조를 &(dyn ToSql + Sync)로 변환
+                            let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = boxed_params.iter()
+                                .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+                                .collect();
+                            
+                            // 쿼리 실행
+                            if let Err(e) = executor.execute_query(&single_query, &param_refs).await {
+                                let error_msg = e.to_string();
+                                // 파티션 관련 오류인지 확인
+                                if error_msg.contains("no partition") || error_msg.contains("partition") {
+                                    // 날짜 파티션이 존재하지 않는 경우 파티션 생성 시도
+                                    error!("파티션 관련 오류 발생: {}", error_msg);
+                                    
+                                    if let Some((_, _, _, _, _, timestamp, _, _, _, _, _)) = batch.request_logs.get(i) {
+                                        // 타임스탬프 파티션을 위한 날짜 추출
+                                        let date = timestamp.date_naive();
+                                        let next_date = date + chrono::Duration::days(1);
+                                        
+                                        // 파티션 이름 생성
+                                        let partition_name = format!("request_logs_{:04}{:02}{:02}", 
+                                            date.year(), date.month(), date.day());
+                                        
+                                        let create_partition_query = format!(
+                                            "CREATE TABLE IF NOT EXISTS {} PARTITION OF request_logs 
+                                            FOR VALUES FROM ('{}') TO ('{}')",
+                                            partition_name, date, next_date
+                                        );
+                                        
+                                        match executor.execute_query(&create_partition_query, &[]).await {
+                                            Ok(_) => {
+                                                info!("누락된 파티션 자동 생성: {}", partition_name);
+                                                
+                                                // 파티션 생성 후 다시 로그 저장 시도
+                                                if let Err(e) = executor.execute_query(&single_query, &param_refs).await {
+                                                    error!("파티션 생성 후에도 요청 로그 삽입 실패: {}", e);
+                                                }
+                                            },
+                                            Err(e) => {
+                                                error!("누락된 파티션 생성 실패: {}", e);
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    error!("요청 로그 삽입 실패: {}", e);
+                                }
+                            }
+                        }
+                    } else {
+                        error!("배치 쿼리로 로그 삽입 실패: {}. 데이터가 손실될 수 있습니다.", e);
                     }
                 }
-        }
-        
-        // 배치 내용을 병렬로 결합
-        let combined_content = batch.entries.par_iter()
-            .fold(String::new, |mut acc, entry| {
-                acc.push_str(entry);
-                acc
-            })
-            .reduce(String::new, |mut acc, partial| {
-                acc.push_str(&partial);
-                acc
-            });
-        
-        // 파일에 로그 작성
-        if let Some(file) = file_cache.get_mut(host) {
-            if let Err(e) = file.write_all(combined_content.as_bytes()).await {
-                error!("Failed to write to log file: {}", e);
             }
+            
+            debug!("로그 배치 처리 완료");
         }
         
         batch.clear();
+        Ok(())
     }
     
-    /// 새로운 로그 파일 생성
-    pub async fn create_log_file(host: &str, session_id: &str) -> Option<File> {
-        // 로그 디렉터리 생성 확인
-        if let Err(e) = tokio::fs::create_dir_all("logs").await {
-            error!("[Session:{}] Failed to create logs directory: {}", session_id, e);
-            return None;
-        }
-        
-        let today = Local::now();
-        let date_str = format!("{:04}{:02}{:02}", today.year(), today.month(), today.day());
-        let request_log_path = format!("logs/request_{}_{}.log", host, date_str);
-        
-        match tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&request_log_path)
-            .await {
-                Ok(file) => Some(file),
-                Err(e) => {
-                    error!("[Session:{}] Failed to create request log file: {}", session_id, e);
-                    None
-                }
-            }
-    }
-
     /// 요청 시작 시간 기록
     pub fn record_request_start(&self, request_id: &str) {
-        if let Ok(mut start_times) = self.request_start_times.write() {
-            start_times.insert(request_id.to_string(), Instant::now());
+        if let Ok(mut times) = self.request_start_times.write() {
+            times.insert(request_id.to_string(), Instant::now());
         }
     }
     
-    /// 응답 완료 시간 기록 및 메트릭 업데이트
+    /// 요청 종료 시간 기록 및 소요 시간 계산
     pub fn record_request_end(&self, request_id: &str) -> Option<u64> {
-        if let Ok(mut start_times) = self.request_start_times.write() {
-            if let Some(start_time) = start_times.remove(request_id) {
+        if let Ok(mut times) = self.request_start_times.write() {
+            if let Some(start_time) = times.remove(request_id) {
                 let duration = start_time.elapsed();
                 let duration_ms = duration.as_millis() as u64;
                 
-                // 로컬 메트릭 업데이트
-                if let Ok(mut metrics) = self.metrics.write() {
-                    metrics.add_response_time(duration_ms);
-                    
-                    // 전역 메트릭스 업데이트
-                    self.global_metrics.update_response_time_stats(duration_ms);
-                    
-                }
-                
+                info!("요청 {} 응답 시간: {} ms", request_id, duration_ms);
                 return Some(duration_ms);
             }
         }
         None
     }
     
-    /// 비동기로 로그 작성
-    pub fn log_async<'a>(&self, content: impl Into<Cow<'a, str>>, host: impl Into<Cow<'a, str>>) -> Result<(), &'static str> {
-        if let Some(sender) = &self.log_sender {
-            let message = LogMessage::RequestLog { 
-                content: content.into().into_owned(), 
-                host: host.into().into_owned() 
-            };
-            if sender.try_send(message).is_err() {
-                return Err("로그 채널이 가득 찼습니다");
-            }
-            Ok(())
-        } else {
-            Err("로그 작성기가 초기화되지 않았습니다")
-        }
-    }
-    
-    /// 비동기로 차단 로그 작성
-    pub fn log_reject_async<'a>(
+    /// 비동기 로그 기록
+    pub fn log_async<'a>(
         &self, 
-        content: impl Into<Cow<'a, str>>, 
         host: impl Into<Cow<'a, str>>, 
-        ip: impl Into<Cow<'a, str>>
-    ) -> Result<(), &'static str> {
-        if let Some(sender) = &self.log_sender {
-            let message = LogMessage::RejectLog { 
-                content: content.into().into_owned(), 
-                host: host.into().into_owned(), 
-                ip: ip.into().into_owned() 
-            };
-            if sender.try_send(message).is_err() {
-                return Err("로그 채널이 가득 찼습니다");
-            }
-            Ok(())
-        } else {
-            Err("로그 작성기가 초기화되지 않았습니다")
-        }
-    }
-
-    /// TLS 요청 데이터 처리 및 로깅
-    pub async fn process_request_data(
-        &self,
-        data: &[u8],
-        file: &mut Option<File>,
-        accumulated_data: &mut Vec<u8>,
-        processing_request: &mut bool,
-        session_id: &str,
-        request_id: &str,
-        host: &str,
-    ) {
-        // 데이터를 누적 버퍼에 추가
-        accumulated_data.extend_from_slice(data);
-        
-        // 버퍼가 너무 커지면 초기화 (메모리 누수 방지)
-        if accumulated_data.len() > BUFFER_SIZE_LARGE {
-            debug!("[Session:{}] Accumulated buffer too large, clearing", session_id);
-            accumulated_data.clear();
-            *processing_request = false;
-            return;
-        }
-        
-        // 데이터를 문자열로 변환
-        let data_str = match std::str::from_utf8(accumulated_data) {
-            Ok(s) => Cow::Borrowed(s),
-            Err(_) => {
-                debug!("[Session:{}] Invalid UTF-8 data in request", session_id);
-                return;
-            }
-        };
-        
-        // 새 HTTP 요청 시작 감지
-        let should_start_processing = !*processing_request && self.is_http_request_start(&data_str);
-        
-        if should_start_processing {
-            *processing_request = true;
-            self.record_request_start(request_id);
-            debug!("[Session:{}] 새 HTTP 요청 감지: {}", 
-                   session_id, data_str.lines().next().unwrap_or(""));
-        }
-        
-        // HTTP 요청 처리
-        if *processing_request {
-            match self.parse_http_request(&data_str, request_id) {
-                ParseResult::Complete { request_line, headers, body, duration_ms } => {
-                    // 로그 내용 구성
-                    let log_content = self.format_log_content(request_line, headers, body, duration_ms);
-                    
-                    // 로그 기록
-                    self.write_log(log_content, file, host, session_id).await;
-                    
-                    // 처리 완료 후 상태 초기화
-                    accumulated_data.clear();
-                    *processing_request = false;
-                },
-                ParseResult::Incomplete => {
-                    // 요청이 아직 완료되지 않음, 더 많은 데이터를 기다림
-                },
-                ParseResult::Invalid => {
-                    // 유효하지 않은 요청, 버퍼 초기화
-                    debug!("[Session:{}] Invalid HTTP request format", session_id);
-                    accumulated_data.clear();
-                    *processing_request = false;
-                }
-            }
-        }
-    }
-    
-    /// HTTP 요청 시작인지 확인
-    fn is_http_request_start<'a>(&self, data: &'a str) -> bool {
-        data.starts_with("GET ") || 
-        data.starts_with("POST ") || 
-        data.starts_with("PUT ") || 
-        data.starts_with("DELETE ") || 
-        data.starts_with("HEAD ") || 
-        data.starts_with("OPTIONS ")
-    }
-    
-    /// HTTP 요청 파싱
-    fn parse_http_request<'a>(&self, data: &'a str, request_id: &str) -> ParseResult {
-        // 헤더와 본문 분리 시도
-        if !data.contains("\r\n\r\n") {
-            return ParseResult::Incomplete;
-        }
-        
-        let parts: Vec<&str> = data.split("\r\n\r\n").collect();
-        let headers_section = parts[0];
-        
-        // 헤더 라인 분리
-        let lines: Vec<&str> = headers_section.lines().collect();
-        if lines.is_empty() {
-            return ParseResult::Invalid;
-        }
-        
-        // 첫 번째 줄은 요청 라인
-        let request_line = lines[0].to_string();
-        
-        // 필요한 헤더 추출 - 병렬 처리로 개선
-        let headers = lines[1..]
-            .par_iter()
-            .filter(|line| {
-                let lower = line.to_lowercase();
-                lower.starts_with("host:") ||
-                lower.starts_with("user-agent:") ||
-                lower.starts_with("referer:") ||
-                lower.starts_with("sec-ch-ua-platform:") ||
-                (request_line.starts_with("POST ") && (
-                    lower.starts_with("content-length:") ||
-                    lower.starts_with("content-type:")
-                ))
-            })
-            .map(|s| s.to_string())
-            .collect::<Vec<String>>();
-        
-        // POST 요청에 대한 본문 처리
-        let body = if request_line.starts_with("POST ") && parts.len() > 1 {
-            // Content-Length 값 추출
-            let content_length = headers.iter()
-                .filter(|h| h.to_lowercase().starts_with("content-length:"))
-                .next()
-                .and_then(|h| {
-                    h.split(':')
-                     .nth(1)
-                     .and_then(|v| v.trim().parse::<usize>().ok())
-                })
-                .unwrap_or(0);
-            
-            let body = parts[1];
-            
-            // 전체 본문을 받았거나 충분한 양을 받았는지 확인
-            if content_length == 0 || body.len() >= content_length || body.len() >= 4096 {
-                // 본문 추가 (최대 4096)
-                let body_preview = if body.len() > 4096 {
-                    format!("{}... (truncated)", &body[0..4096])
-                } else {
-                    body.to_string()
-                };
-                
-                Some(body_preview)
-            } else {
-                // 아직 본문이 완전히 수신되지 않음
-                return ParseResult::Incomplete;
-            }
-        } else {
-            None
-        };
-        
-        // 응답 시간 계산
-        let duration_ms = self.record_request_end(request_id);
-        
-        ParseResult::Complete {
-            request_line,
-            headers,
-            body,
-            duration_ms,
-        }
-    }
-    
-    /// 로그 내용 형식화
-    fn format_log_content(
-        &self,
-        request_line: String,
-        headers: Vec<String>,
+        method: impl Into<Cow<'a, str>>,
+        path: impl Into<Cow<'a, str>>,
+        header: impl Into<Cow<'a, str>>,
         body: Option<String>,
-        duration_ms: Option<u64>,
-    ) -> String {
-        // 용량 예상해서 미리 할당
-        let mut content = String::with_capacity(
-            request_line.len() + 
-            headers.iter().map(|h| h.len() + 1).sum::<usize>() + 
-            body.as_ref().map_or(0, |b| b.len() + 2) +
-            duration_ms.map_or(0, |_| 30)
-        );
+        session_id: impl Into<Cow<'a, str>>,
+        client_ip: impl Into<Cow<'a, str>>,
+        target_ip: impl Into<Cow<'a, str>>,
+        response_time: Option<u64>,
+        is_rejected: bool
+    ) -> Result<(), &'static str> {
+        let host_str = host.into().to_string();
+        let method_str = method.into().to_string();
+        let path_str = path.into().to_string();
+        let header_str = header.into().to_string();
+        let session_id_str = session_id.into().to_string();
+        let client_ip_str = client_ip.into().to_string();
+        let target_ip_str = target_ip.into().to_string();
         
-        // 요청 라인 추가
-        content.push_str(&request_line);
-        content.push('\n');
-        
-        // 헤더 추가
-        for header in headers {
-            content.push_str(&header);
-            content.push('\n');
-        }
-        
-        // 본문 추가 (있는 경우)
-        if let Some(body_text) = body {
-            content.push('\n'); // 헤더와 본문 사이 빈 줄
-            content.push_str(&body_text);
-        }
-        
-        // 응답 시간 추가 (있는 경우)
-        if let Some(time) = duration_ms {
-            content.push_str("\nResponse-Time: ");
-            content.push_str(&time.to_string());
-            content.push_str(" ms\n");
-        }
-        
-        content
-    }
-    
-    /// 로그 파일에 기록
-    async fn write_log(&self, log_content: String, file: &mut Option<File>, host: &str, session_id: &str) {
-        if let Some(file) = file {
-            if let Err(e) = file.write_all(format!("{}\n\n", log_content).as_bytes()).await {
-                error!("[Session:{}] Failed to write to request log file: {}", session_id, e);
-            }
-        } else {
-            // 비동기 로깅 시도
-            if let Err(e) = self.log_async(log_content, host) {
-                error!("[Session:{}] Failed to log asynchronously: {}", session_id, e);
+        match &self.log_sender {
+            Some(sender) => {
+                let timestamp = Utc::now();
+                let session_id_clone = session_id_str.clone(); // session_id_str 복제
+                
+                if sender.try_send(LogMessage::RequestLog { 
+                    host: host_str, 
+                    method: method_str,
+                    path: path_str,
+                    header: header_str,
+                    body,
+                    timestamp, 
+                    session_id: session_id_str,
+                    client_ip: client_ip_str,
+                    target_ip: target_ip_str,
+                    response_time,
+                    is_rejected
+                }).is_err() {
+                    warn!("[Session:{}] 로그 채널이 가득 찼습니다", session_id_clone);
+                    return Err("로그 채널이 가득 찼습니다");
+                }
+                Ok(())
+            },
+            None => {
+                // 로그 채널이 초기화되지 않았을 때 경고만 출력하고 계속 진행
+                warn!("[Session:{}] 로그 채널이 초기화되지 않았습니다. 로그를 기록할 수 없습니다.", session_id_str);
+                Ok(())
             }
         }
     }
     
     /// 차단된 요청 로깅
     pub async fn log_rejected_request(&self, request: &str, host: &str, ip: &str, session_id: &str) {
-        let mut log_content = String::new();
+        let (method, path, header, body) = self.parse_request_for_reject(request);
         
-        // 헤더 라인 분리
-        let lines: Vec<&str> = request.lines().collect();
-        if !lines.is_empty() {
-            // 요청 라인 (첫 번째 줄)
-            log_content.push_str(&format!("{} [BLOCKED]\n", lines[0]));
+        if let Some(sender) = &self.log_sender {
+            let log_message = LogMessage::RequestLog {
+                host: host.to_string(),
+                client_ip: ip.to_string(),
+                method,
+                path,
+                header,
+                body,
+                timestamp: Utc::now(),
+                session_id: session_id.to_string(),
+                target_ip: "Blocked".to_string(), // 차단된 요청은 타겟 IP를 "Blocked"로 표시
+                response_time: None,
+                is_rejected: true
+            };
             
-            // 필요한 헤더 추출 - 병렬 처리로 개선
-            let filtered_headers: Vec<String> = lines[1..]
-                .par_iter()
-                .filter(|line| {
-                    let lower = line.to_lowercase();
-                    lower.starts_with("host:") ||
-                    lower.starts_with("user-agent:") ||
-                    lower.starts_with("referer:") ||
-                    lower.starts_with("sec-ch-ua-platform:")
-                })
-                .map(|&s| format!("{}\n", s))
-                .collect();
-                
-            // 헤더 추가
-            for header in filtered_headers {
-                log_content.push_str(&header);
-            }
-            
-            // 비동기 로깅 시도
-            if let Err(e) = self.log_reject_async(log_content, host, ip) {
-                error!("[Session:{}] Failed to log rejected request: {}", session_id, e);
+            if let Err(e) = sender.send(log_message).await {
+                error!("차단 로그 전송 실패: {}", e);
             }
         }
+    }
+    
+    /// 응답 시간 업데이트 - 배치 업데이트 지원
+    pub async fn update_response_time(&self, session_id: &str, response_time: u64) -> Result<(), Box<dyn Error + Send + Sync>> {
+        // DB 연결 획득
+        let executor = match db::query::QueryExecutor::get_instance().await {
+            Ok(executor) => executor,
+            Err(e) => {
+                error!("응답 시간 업데이트를 위한 쿼리 실행기 가져오기 실패: {}", e);
+                return Err(e.into());
+            }
+        };
+        
+        // 업데이트 쿼리 실행 - 서브쿼리를 사용하여 ORDER BY와 LIMIT 문제 해결
+        let query = "
+            UPDATE request_logs 
+            SET response_time = $1 
+            WHERE id = (
+                SELECT id 
+                FROM request_logs 
+                WHERE session_id = $2 
+                AND timestamp > NOW() - INTERVAL '1 hour'
+                AND response_time IS NULL
+                ORDER BY timestamp DESC
+                LIMIT 1
+            )";
+        
+        let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
+            &(response_time as i64),
+            &session_id
+        ];
+        
+        match executor.execute_query(query, params).await {
+            Ok(rows) => {
+                if rows > 0 {
+                    debug!("[Session:{}] 응답 시간 업데이트 성공: {}ms", session_id, response_time);
+                } else {
+                    debug!("[Session:{}] 응답 시간 업데이트할 로그 레코드를 찾을 수 없음", session_id);
+                }
+                Ok(())
+            },
+            Err(e) => {
+                error!("[Session:{}] 응답 시간 업데이트 실패: {}", session_id, e);
+                Err(e.into())
+            }
+        }
+    }
+    
+    /// 차단 로깅을 위한 요청 파싱
+    fn parse_request_for_reject(&self, request: &str) -> (String, String, String, Option<String>) {
+        let lines: Vec<&str> = request.split("\r\n").collect();
+        if lines.is_empty() {
+            return ("UNKNOWN".to_string(), "/".to_string(), "".to_string(), None);
+        }
+        
+        // 요청 라인 파싱
+        let request_line_parts: Vec<&str> = lines[0].split_whitespace().collect();
+        let method = if request_line_parts.len() > 0 {
+            request_line_parts[0].to_string()
+        } else {
+            "UNKNOWN".to_string()
+        };
+        
+        let path = if request_line_parts.len() > 1 {
+            request_line_parts[1].to_string()
+        } else {
+            "/".to_string()
+        };
+        
+        // 헤더 파싱
+        let mut header_str = String::new();
+        let mut i = 1;
+        while i < lines.len() && !lines[i].is_empty() {
+            if !header_str.is_empty() {
+                header_str.push_str("\r\n");
+            }
+            header_str.push_str(lines[i]);
+            i += 1;
+        }
+        
+        // 본문 파싱 - 메서드에 따라 다르게 처리
+        let mut body = None;
+        if method == "POST" || method == "PUT" || method == "PATCH" {
+            if i < lines.len() - 1 {
+                let body_start = i + 1;
+                let body_content = lines[body_start..].join("\r\n");
+                if !body_content.is_empty() {
+                    body = Some(body_content);
+                }
+            }
+        }
+        
+        (method, path, header_str, body)
+    }
+    
+    /// 기본 테이블 생성을 확인하고 필요시 생성하는 메서드
+    async fn ensure_base_tables() -> Result<(), Box<dyn Error + Send + Sync>> {
+        debug!("기본 로깅 테이블 확인 중...");
+        
+        // 쿼리 실행기 가져오기
+        let executor = match db::query::QueryExecutor::get_instance().await {
+            Ok(executor) => executor,
+            Err(e) => {
+                error!("쿼리 실행기 가져오기 실패: {}", e);
+                return Err(e.into());
+            }
+        };
+        
+        // 요청 로그 테이블 생성
+        let request_logs_query = "
+            CREATE TABLE IF NOT EXISTS request_logs (
+                id SERIAL,
+                host TEXT NOT NULL,
+                method TEXT NOT NULL,
+                path TEXT NOT NULL,
+                header TEXT NOT NULL,
+                body TEXT,
+                timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                session_id TEXT NOT NULL,
+                client_ip TEXT NOT NULL,
+                target_ip TEXT NOT NULL,
+                response_time BIGINT,
+                is_rejected BOOLEAN NOT NULL DEFAULT FALSE
+            ) PARTITION BY RANGE (timestamp)";
+        
+        if let Err(e) = executor.execute_query(request_logs_query, &[]).await {
+            error!("request_logs 테이블 생성 실패: {}", e);
+            return Err(e);
+        }
+        
+        // 오늘 날짜에 대한 파티션 생성 시도
+        let today = chrono::Local::now().date_naive();
+        let tomorrow = today + chrono::Duration::days(1);
+        
+        // request_logs 파티션 생성
+        let req_partition_name = format!("request_logs_{:04}{:02}{:02}", 
+            today.year(), today.month(), today.day());
+        
+        let req_partition_query = format!(
+            "CREATE TABLE IF NOT EXISTS {} PARTITION OF request_logs 
+             FOR VALUES FROM ('{}') TO ('{}')",
+            req_partition_name, today, tomorrow
+        );
+        
+        if let Err(e) = executor.execute_query(&req_partition_query, &[]).await {
+            warn!("request_logs 파티션 생성 실패: {}", e);
+            // 파티션 생성 실패해도 진행
+        } else {
+            debug!("request_logs 파티션 생성 완료: {}", req_partition_name);
+        }
+        
+        debug!("기본 로깅 테이블 및 파티션 확인 완료");
+        Ok(())
     }
 } 

@@ -110,11 +110,14 @@ impl BlockPage {
     
     /// 차단 요청 로깅
     async fn log_blocked_request(&self, request_data: &str, host: &str, ip: &str, session_id: &str) {
+        // 간단하게 try_read()로 돌아가되, 비동기적으로 처리
         if let Ok(logger) = REQUEST_LOGGER.try_read() {
-            let log_content = format!("{} [BLOCKED]\n", request_data);
-            logger.log_rejected_request(log_content.as_str(), host, ip, session_id).await;
+            // 요청 파싱 및 로깅
+            // 여기서는 RequestLogger의 parse_request_for_reject 메서드를 사용하는 것이 적절합니다
+            logger.log_rejected_request(request_data, host, ip, session_id).await;
+            debug!("[Session:{}] 차단된 요청 로깅 시도 완료", session_id);
         } else {
-            error!("[Session:{}] Failed to acquire RequestLogger lock for blocked request logging", session_id);
+            debug!("[Session:{}] RequestLogger 읽기 락 획득 실패", session_id);
         }
     }
     
