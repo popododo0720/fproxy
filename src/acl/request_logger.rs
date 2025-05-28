@@ -1,13 +1,10 @@
 use log::{debug, error, info, warn};
 use tokio::sync::mpsc::{self, Sender, Receiver};
 use tokio::time::{sleep, Duration as TokioDuration};
-use std::collections::{VecDeque, HashMap};
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant, SystemTime};
 use std::borrow::Cow;
 use std::error::Error;
+use std::time::Instant;
 use chrono::{DateTime, Utc, Datelike};
-use smallvec::SmallVec;
 
 use crate::constants::*;
 use crate::db;
@@ -32,81 +29,6 @@ pub enum LogMessage {
         is_tls: bool
     },
     FlushLogs,
-}
-
-/// 응답 시간 정보 구조체
-#[derive(Debug, Clone, Copy)]
-struct ResponseTimeInfo {
-    timestamp: SystemTime,
-    response_time: u64,
-}
-
-/// 응답 시간 메트릭을 저장하는 구조체
-#[derive(Debug, Default)]
-pub struct ResponseMetrics {
-    // 최근 1분간 응답 시간 기록 (timestamp, duration_ms)
-    recent_responses: VecDeque<ResponseTimeInfo>,
-    total_responses: usize,
-    total_duration_ms: u64,
-    min_duration_ms: u64,
-    max_duration_ms: u64,
-}
-
-impl ResponseMetrics {
-    /// 새 ResponseMetrics 인스턴스 생성
-    pub fn new() -> Self {
-        ResponseMetrics {
-            recent_responses: VecDeque::with_capacity(MAX_RECENT_RESPONSES),
-            total_responses: 0,
-            total_duration_ms: 0,
-            min_duration_ms: u64::MAX,
-            max_duration_ms: 0,
-        }
-    }
-
-    /// 응답 시간 추가
-    pub fn add_response_time(&mut self, duration_ms: u64) {
-        self.clean_old_responses();
-        
-        // 통계 업데이트
-        self.total_responses += 1;
-        self.total_duration_ms += duration_ms;
-        
-        // 최소/최대 업데이트
-        if duration_ms < self.min_duration_ms {
-            self.min_duration_ms = duration_ms;
-        }
-        if duration_ms > self.max_duration_ms {
-            self.max_duration_ms = duration_ms;
-        }
-        
-        // 최근 응답 시간 추가
-        self.recent_responses.push_back(ResponseTimeInfo {
-            timestamp: SystemTime::now(),
-            response_time: duration_ms,
-        });
-    }
-    
-    /// 1분 이상 지난 응답 제거
-    fn clean_old_responses(&mut self) {
-        if let Ok(now) = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
-            let one_minute_ago = now - Duration::from_secs(60);
-            
-            // 1분 이상 지난 응답 제거
-            while let Some(front) = self.recent_responses.front() {
-                if let Ok(timestamp) = front.timestamp.duration_since(SystemTime::UNIX_EPOCH) {
-                    if timestamp < one_minute_ago {
-                        self.recent_responses.pop_front();
-                    } else {
-                        break;
-                    }
-                } else {
-                    // 타임스탬프 오류 발생 시 제거
-                    self.recent_responses.pop_front();
-                }
-            }
-        }
-    }
 }
 
 /// 로그 배치 구조체
@@ -189,9 +111,9 @@ impl LogBatch {
     }
     
     // 단일 로그 항목에 대한 파라미터 생성
-    fn create_single_params(&self, index: usize) -> Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> {
+    fn create_single_params(&self, index: usize) -> Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send + '_>> {
         if let Some((host, method, path, header, body, timestamp, session_id, client_ip, target_ip, response_time, is_rejected, is_tls)) = self.request_logs.get(index) {
-            let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::with_capacity(12);
+            let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send + '_>> = Vec::with_capacity(12);
             
             params.push(Box::new(host.clone()));
             params.push(Box::new(method.clone()));
@@ -220,29 +142,13 @@ impl LogBatch {
 /// TLS 요청 로깅을 담당하는 구조체
 #[derive(Clone)]
 pub struct RequestLogger {
-    request_start_times: Arc<RwLock<HashMap<String, Instant>>>,
     log_sender: Option<Sender<LogMessage>>,
-}
-
-/// HTTP 요청 파싱 결과
-#[derive(Debug)]
-enum ParseResult {
-    Complete {
-        method: String,
-        path: String,
-        header: SmallVec<[String; 16]>,
-        body: Option<String>,
-        duration_ms: Option<u64>,
-    },
-    Incomplete,
-    Invalid,
 }
 
 impl RequestLogger {
     /// 새 RequestLogger 인스턴스 생성
     pub fn new() -> Self {
         RequestLogger {
-            request_start_times: Arc::new(RwLock::new(HashMap::with_capacity(128))),
             log_sender: None,
         }
     }
@@ -354,22 +260,22 @@ impl RequestLogger {
         };
         
         // 배치 처리 시도
-        let (query, params) = batch.create_batch_query();
+        let (_query, _params) = batch.create_batch_query();
         
         // 요청 로그 플러시
         if !batch.request_logs.is_empty() {
             debug!("배치 쿼리로 {} 개의 로그 삽입 시도", batch.request_logs.len());
             
             // 배치 쿼리 및 파라미터 생성
-            let (query, params) = batch.create_batch_query();
+            let (_query, _params) = batch.create_batch_query();
             
             // 파라미터 참조 벡터 생성
-            let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params.iter()
+            let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = _params.iter()
                 .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
                 .collect();
             
             // 배치 쿼리 실행
-            match executor.execute_query(&query, &param_refs).await {
+            match executor.execute_query(&_query, &param_refs).await {
                 Ok(rows) => {
                     debug!("배치 쿼리로 {} 개의 로그 삽입 성공", rows);
                 },
@@ -400,7 +306,7 @@ impl RequestLogger {
                                     // 날짜 파티션이 존재하지 않는 경우 파티션 생성 시도
                                     error!("파티션 관련 오류 발생: {}", error_msg);
                                     
-                                    if let Some((host, method, path, header, body, timestamp, session_id, client_ip, target_ip, response_time, is_rejected, is_tls)) = batch.request_logs.get(i) {
+                                    if let Some((_, _, _, _, _, timestamp, _, _, _, _, _, _)) = batch.request_logs.get(i) {
                                         // 타임스탬프 파티션을 위한 날짜 추출
                                         let date = timestamp.date_naive();
                                         let next_date = date + chrono::Duration::days(1);
@@ -445,27 +351,6 @@ impl RequestLogger {
         
         batch.clear();
         Ok(())
-    }
-    
-    /// 요청 시작 시간 기록
-    pub fn record_request_start(&self, request_id: &str) {
-        if let Ok(mut times) = self.request_start_times.write() {
-            times.insert(request_id.to_string(), Instant::now());
-        }
-    }
-    
-    /// 요청 종료 시간 기록 및 소요 시간 계산
-    pub fn record_request_end(&self, request_id: &str) -> Option<u64> {
-        if let Ok(mut times) = self.request_start_times.write() {
-            if let Some(start_time) = times.remove(request_id) {
-                let duration = start_time.elapsed();
-                let duration_ms = duration.as_millis() as u64;
-                
-                info!("요청 {} 응답 시간: {} ms", request_id, duration_ms);
-                return Some(duration_ms);
-            }
-        }
-        None
     }
     
     /// 비동기 로그 기록

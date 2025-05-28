@@ -19,7 +19,6 @@ pub const BUFFER_STATS_INTERVAL_SECS: u64 = 5;     // 버퍼 통계 출력
 
 pub const TCP_NODELAY: bool = true;
 pub const TCP_QUICKACK: bool = true;  // TCP QUICKACK 활성화
-pub const USE_SPLICE: bool = true;    // 제로 카피 활성화
 
 // LRU 캐시 크기
 pub const CERT_CACHE_SIZE: usize = 1000;         // 인증서 캐시 크기
@@ -30,9 +29,6 @@ pub const ACL_CACHE_SIZE: usize = 10000;         // ACL 결과 캐시 크기
 pub const CA_CERT_FILE: &str = "ssl/ca_cert.pem";
 pub const CA_KEY_FILE: &str = "ssl/ca_key.pem";
 pub const CA_CERT_CRT_FILE: &str = "ssl/ca_cert.crt";
-
-// 최근 응답 시간 저장 개수
-pub const MAX_RECENT_RESPONSES: usize = 1000;
 
 // 로그 배치 크기 및 플러시 간격
 pub const LOG_BATCH_SIZE: usize = 1000;

@@ -8,13 +8,12 @@ use super::config::DbConfig;
 
 /// 파티션 관리자 구조체
 pub struct PartitionManager {
-    config: DbConfig,
 }
 
 impl PartitionManager {
     /// 새 PartitionManager 인스턴스 생성
-    pub fn new(config: DbConfig) -> Self {
-        Self { config }
+    pub fn new(_config: DbConfig) -> Self {
+        Self { }
     }
     
     /// 파티션 관리 상태 확인 및 필요한 파티션 생성
@@ -304,29 +303,4 @@ pub async fn ensure_partitions() -> Result<(), Box<dyn Error + Send + Sync>> {
             Err(e)
         }
     }
-}
-
-/// 수동으로 파티션 생성 (글로벌 함수)
-pub async fn create_partitions(
-    table_name: &str,
-    start_date: chrono::NaiveDate,
-    num_days: i32
-) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
-    let db_config = DbConfig::get()?;
-    let manager = PartitionManager::new(db_config);
-    let client = get_client().await?;
-    
-    manager.create_partitions(&client, table_name, start_date, num_days).await
-}
-
-/// 오래된 파티션 삭제 (글로벌 함수)
-pub async fn drop_old_partitions(
-    table_name: &str,
-    older_than_days: i32
-) -> Result<usize, Box<dyn Error + Send + Sync>> {
-    let db_config = DbConfig::get()?;
-    let partition_manager = PartitionManager::new(db_config);
-    let client = get_client().await?;
-    
-    partition_manager.drop_old_partitions(&client, table_name, older_than_days).await
 } 

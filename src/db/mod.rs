@@ -7,4 +7,4 @@ pub mod partition;
 pub mod query;
 
 // 외부로 노출할 항목들
-pub use partition::ensure_partitions; // ensure_partitions는 여러 곳에서 사용 
+pub use partition::ensure_partitions; 

@@ -35,11 +35,6 @@ impl DatabasePool {
         self.pool.get().await
     }
     
-    /// 설정 가져오기
-    pub fn get_config(&self) -> &DbConfig {
-        &self.config
-    }
-    
     /// 풀 상태 확인
     pub fn get_pool_status(&self) -> PoolStatus {
         PoolStatus {

@@ -127,24 +127,6 @@ impl DbConfig {
         }
     }
 
-    /// 연결 문자열 생성
-    pub fn get_connection_string(&self) -> String {
-        format!(
-            "host={} port={} dbname={} user={} password={} sslmode={}",
-            self.connection.host,
-            self.connection.port,
-            self.connection.database,
-            self.connection.user,
-            self.connection.password,
-            self.connection.sslmode
-        )
-    }
-
-    /// 연결 제한 시간 설정 가져오기
-    pub fn get_connection_timeout(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.connection.connection_timeout_seconds)
-    }
-    
     /// 연결 풀 최대 크기 가져오기
     pub fn get_max_connections(&self) -> usize {
         self.connection.max_connections

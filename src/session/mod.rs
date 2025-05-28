@@ -27,9 +27,6 @@ struct HttpRequest {
     method: String,
     host: String,
     port: u16,
-    path: String,
-    headers: String,
-    body: Option<String>,
 }
 
 pub struct Session {
@@ -116,7 +113,7 @@ impl Session {
         }
 
         // 요청 처리
-        self.metrics.increment_request_count(is_connect);
+        self.metrics.connection_opened(is_connect);
 
         if is_connect {
             // HTTPS 요청 처리
@@ -183,18 +180,12 @@ impl Session {
                         method,
                         host: host.to_string(),
                         port,
-                        path: "/".to_string(),
-                        headers: "".to_string(),
-                        body: None,
                     })
                 } else {
                     Ok(HttpRequest {
                         method,
                         host: host_port.to_string(),
                         port: 443,
-                        path: "/".to_string(),
-                        headers: "".to_string(),
-                        body: None,
                     })
                 }
             } else {
@@ -205,7 +196,6 @@ impl Session {
             // HTTP 메서드 파싱
             let mut host = String::new();
             let mut port = 80;
-            let mut path = "/".to_string();
             
             // Host 헤더에서 호스트 추출
             if let Some(host_line) = request_str.lines()
@@ -236,14 +226,6 @@ impl Session {
                             } else {
                                 host = host_part.to_string();
                             }
-                            
-                            // 경로 추출
-                            if let Some(path_idx) = without_scheme.find('/') {
-                                path = without_scheme[path_idx..].to_string();
-                                if path.is_empty() {
-                                    path = "/".to_string();
-                                }
-                            }
                         } else {
                             error!("[Session:{}] Invalid host in URL", self.session_id());
                             return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid host in URL").into());
@@ -252,9 +234,6 @@ impl Session {
                         error!("[Session:{}] Invalid URL format", self.session_id());
                         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid URL format").into());
                     }
-                } else {
-                    // URL에서 경로만 추출
-                    path = url_part.to_string();
                 }
             }
             
@@ -263,29 +242,10 @@ impl Session {
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Missing host information").into());
             }
             
-            // 헤더와 본문 분리
-            let mut headers = String::new();
-            let mut body = None;
-            
-            if let Some(header_end) = request_str.find("\r\n\r\n") {
-                headers = request_str[..header_end].to_string();
-                
-                // 본문 추출 (있는 경우)
-                let body_start = header_end + 4; // "\r\n\r\n" 길이
-                if body_start < request_str.len() {
-                    body = Some(request_str[body_start..].to_string());
-                }
-            } else {
-                headers = request_str.to_string();
-            }
-            
             Ok(HttpRequest {
                 method,
                 host,
                 port,
-                path,
-                headers,
-                body,
             })
         }
     }
@@ -344,7 +304,6 @@ impl Session {
             // 요청 파싱
             let mut method = "UNKNOWN".to_string();
             let mut path = "/".to_string();
-            let headers;
             let mut body = None;
             
             // 요청 라인 추출 및 메서드, 경로 파싱
@@ -357,6 +316,7 @@ impl Session {
             }
             
             // 헤더와 본문 분리
+            let headers;
             if let Some(header_end) = request_str.find("\r\n\r\n") {
                 headers = request_str[..header_end].to_string();
                 
@@ -494,7 +454,6 @@ impl Session {
             // 요청 파싱
             let mut method = "UNKNOWN".to_string();
             let mut path = "/".to_string();
-            let headers;
             let mut body = None;
             
             // 요청 라인 추출 및 메서드, 경로 파싱
@@ -507,6 +466,7 @@ impl Session {
             }
             
             // 헤더와 본문 분리
+            let headers;
             if let Some(header_end) = request_str.find("\r\n\r\n") {
                 headers = request_str[..header_end].to_string();
                 
