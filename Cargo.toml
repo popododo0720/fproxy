@@ -24,6 +24,7 @@ rustls-native-certs = "0.7.0"
 chrono = "0.4.35"
 lru = "0.14.0"
 libc = "0.2.172"
+rayon = "1.10.0"
 
 [profile.release]
 opt-level = 3      # 최적화 수준 3

@@ -8,6 +8,12 @@ pub const SMALL_POOL_SIZE: usize = 2000;
 pub const MEDIUM_POOL_SIZE: usize = 1000;
 pub const LARGE_POOL_SIZE: usize = 200;
 
+// 적응형 버퍼링 시스템 설정
+pub const BUFFER_ADJUSTMENT_INTERVAL_SECS: u64 = 30;  // 버퍼 크기 조정 간격
+pub const BUFFER_USAGE_THRESHOLD_HIGH: f64 = 0.8;     // 버퍼 풀 확장 임계값 (80%)
+pub const BUFFER_USAGE_THRESHOLD_LOW: f64 = 0.3;      // 버퍼 풀 축소 임계값 (30%)
+pub const BUFFER_POOL_ADJUSTMENT_RATE: f64 = 0.2;     // 버퍼 풀 조정 비율 (20%)
+
 pub const METRICS_INTERVAL_SECS: u64 = 5;         // 메트릭 출력
 pub const BUFFER_STATS_INTERVAL_SECS: u64 = 5;     // 버퍼 통계 출력
 
@@ -21,7 +27,7 @@ pub const USE_SPLICE: bool = true;    // 제로 카피 활성화
 pub const CERT_CACHE_SIZE: usize = 1000;         // 인증서 캐시 크기
 pub const TLS_SESSION_CACHE_SIZE: usize = 5000;  // TLS 세션 캐시 크기
 // pub const DNS_CACHE_SIZE: usize = 5000;          // DNS 캐시 크기
-// pub const ACL_CACHE_SIZE: usize = 10000;         // ACL 결과 캐시 크기
+pub const ACL_CACHE_SIZE: usize = 10000;         // ACL 결과 캐시 크기
 
 // 루트 CA 인증서 파일 경로
 pub const CA_CERT_FILE: &str = "ssl/ca_cert.pem";

@@ -1,15 +1,24 @@
 use std::sync::Arc;
-use log::info;
+use log::{info, debug};
+use std::num::NonZeroUsize;
+use std::sync::RwLock;
+use lru::LruCache;
+use once_cell::sync::Lazy;
 
 use crate::config::Config;
+use crate::constants::ACL_CACHE_SIZE;
 
 /// 도메인 매칭 결과를 나타내는 열거형
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum MatchResult {
     ExactMatch(String),
     WildcardMatch(String, String),
     NoMatch,
 }
+
+// 도메인 차단 결과 캐시
+static DOMAIN_BLOCK_CACHE: Lazy<RwLock<LruCache<String, MatchResult>>> = 
+    Lazy::new(|| RwLock::new(LruCache::new(NonZeroUsize::new(ACL_CACHE_SIZE).unwrap())));
 
 /// 도메인 차단을 처리하는 구조체
 pub struct DomainBlocker {
@@ -19,6 +28,7 @@ pub struct DomainBlocker {
 impl DomainBlocker {
     /// 새로운 DomainBlocker 인스턴스 생성
     pub fn new(config: Arc<Config>) -> Self {
+        debug!("DomainBlocker 초기화: 캐시 크기 {}", ACL_CACHE_SIZE);
         Self { 
             config,
         }
@@ -28,8 +38,28 @@ impl DomainBlocker {
     pub fn is_blocked(&self, host: &str) -> bool {
         let host_lower = host.to_lowercase();
         
+        // 캐시에서 결과 확인
+        if let Some(result) = self.check_cache(&host_lower) {
+            match &result {
+                MatchResult::ExactMatch(domain) => {
+                    info!("캐시된 차단 도메인 감지 (정확히 일치): {}", domain);
+                    return true;
+                },
+                MatchResult::WildcardMatch(pattern, domain) => {
+                    info!("캐시된 차단 도메인 감지 (와일드카드 패턴 {} 일치): {}", pattern, domain);
+                    return true;
+                },
+                MatchResult::NoMatch => return false,
+            }
+        }
+        
         // 도메인 매칭 시도
-        match self.match_domain(&host_lower) {
+        let result = self.match_domain(&host_lower);
+        
+        // 결과를 캐시에 저장
+        self.update_cache(&host_lower, result.clone());
+        
+        match result {
             MatchResult::ExactMatch(domain) => {
                 info!("차단된 도메인 감지 (정확히 일치): {}", domain);
                 true
@@ -39,6 +69,21 @@ impl DomainBlocker {
                 true
             },
             MatchResult::NoMatch => false,
+        }
+    }
+    
+    /// 캐시에서 도메인 차단 결과 확인
+    fn check_cache(&self, host: &str) -> Option<MatchResult> {
+        if let Ok(cache) = DOMAIN_BLOCK_CACHE.read() {
+            return cache.peek(host).cloned();
+        }
+        None
+    }
+    
+    /// 캐시에 도메인 차단 결과 저장
+    fn update_cache(&self, host: &str, result: MatchResult) {
+        if let Ok(mut cache) = DOMAIN_BLOCK_CACHE.write() {
+            cache.put(host.to_string(), result);
         }
     }
     
