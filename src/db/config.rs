@@ -73,9 +73,9 @@ impl Default for DbConfig {
                 connection_timeout_seconds: default_connection_timeout(),
             },
             partitioning: PartitionConfig {
-                creation_interval: 30,
+                creation_interval: 1,
                 retention_period: 365,
-                future_partitions: 2,
+                future_partitions: 1,
             },
         }
     }

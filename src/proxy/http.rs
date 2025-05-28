@@ -261,9 +261,6 @@ pub async fn proxy_http_streams(
                                             let duration = start_time.elapsed();
                                             let duration_ms = duration.as_millis() as u64;
                                             
-                                            // 응답 시간 메트릭 업데이트
-                                            metrics_clone.update_response_time_stats(duration_ms);
-                                            
                                             // 응답 시간 로그 기록
                                             if let Ok(logger) = REQUEST_LOGGER.try_read() {
                                                 // 여기서는 호스트 정보를 알 수 없으므로 세션 ID만 사용하여 로그 업데이트

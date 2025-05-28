@@ -57,9 +57,6 @@ impl ProxyServer {
                         }
                     };
 
-                    // 연결이 생성될 때 카운트 증가
-                    worker_metrics.total_connection_opened();
-
                     let session = Session::new(
                         client_stream,
                         client_addr,
@@ -68,13 +65,9 @@ impl ProxyServer {
                         worker_buffer_pool.clone(),
                     );
 
-                    // 에러 처리를 위한 메트릭스 참조
-                    let metrics_error = worker_metrics.clone();
-
                     tokio::spawn(async move {
                         if let Err(e) = session.handle().await {
                             error!("An error occurred while processing the session: {}", e);
-                            metrics_error.record_error();
                         }
                     });
                 }

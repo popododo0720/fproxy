@@ -28,9 +28,6 @@ rayon = "1.10.0"
 tokio-postgres = { version = "0.7.13", features = ["with-chrono-0_4"] }
 deadpool = "0.12.2"
 deadpool-postgres = "0.14.1"
-postgres-types = { version = "0.2.9", features = ["derive", "with-chrono-0_4"] }
-futures = "0.3.31"
-smallvec = { version = "1.15.0", features = ["union"] }
 
 [profile.release]
 opt-level = 3      # 최적화 수준

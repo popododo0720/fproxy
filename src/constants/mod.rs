@@ -14,7 +14,6 @@ pub const BUFFER_USAGE_THRESHOLD_HIGH: f64 = 0.8;     // 버퍼 풀 확장 임�
 pub const BUFFER_USAGE_THRESHOLD_LOW: f64 = 0.3;      // 버퍼 풀 축소 임계값 (30%)
 pub const BUFFER_POOL_ADJUSTMENT_RATE: f64 = 0.2;     // 버퍼 풀 조정 비율 (20%)
 
-pub const METRICS_INTERVAL_SECS: u64 = 5;         // 메트릭 출력
 pub const BUFFER_STATS_INTERVAL_SECS: u64 = 5;     // 버퍼 통계 출력
 
 pub const TCP_NODELAY: bool = true;
