@@ -1,10 +1,11 @@
 use std::error::Error;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::fs;
 use std::path::Path;
 use std::sync::{Mutex, RwLock};
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 
 use log::{debug, error, info, warn};
 use rcgen::{Certificate, CertificateParams, DistinguishedName, DnType, SanType, KeyPair};
@@ -13,6 +14,8 @@ use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector, server::TlsStream as ServerTlsStream, client::TlsStream as ClientTlsStream};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use once_cell::sync::Lazy;
+use lru::LruCache;
+use nix::libc;
 
 use crate::constants::*;
 use crate::config::Config;
@@ -20,9 +23,17 @@ use crate::config::Config;
 // 루트 CA 인증서와 키를 저장하는 전역 변수
 static ROOT_CA: Lazy<Mutex<Option<Certificate>>> = Lazy::new(|| Mutex::new(None));
 
-// 도메인별 인증서 캐시
+// 도메인별 인증서 캐시 - LRU 캐시로 변경
 type CertKeyPair = (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>);
-static CERT_CACHE: Lazy<RwLock<HashMap<String, CertKeyPair>>> = 
+static CERT_CACHE: Lazy<RwLock<LruCache<String, (CertKeyPair, Instant)>>> = 
+    Lazy::new(|| RwLock::new(LruCache::new(NonZeroUsize::new(CERT_CACHE_SIZE).unwrap_or(NonZeroUsize::new(1000).unwrap()))));
+
+// TLS 세션 캐시 추가
+static TLS_SESSION_CACHE: Lazy<RwLock<LruCache<String, Vec<u8>>>> =
+    Lazy::new(|| RwLock::new(LruCache::new(NonZeroUsize::new(TLS_SESSION_CACHE_SIZE).unwrap_or(NonZeroUsize::new(5000).unwrap()))));
+
+// 클라이언트 TLS 설정 캐시 (재사용을 위함)
+static CLIENT_TLS_CONFIGS: Lazy<RwLock<HashMap<bool, Arc<ClientConfig>>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
 /// 루트 CA 인증서를 초기화합니다
@@ -89,31 +100,40 @@ pub fn init_root_ca() -> Result<(), Box<dyn Error + Send + Sync>> {
 pub async fn generate_fake_cert(host: &str) -> Result<CertKeyPair, Box<dyn Error + Send + Sync>> {
     // 캐시에서 인증서 확인
     {
-        let cache = CERT_CACHE.read().unwrap();
-        if let Some(cert) = cache.get(host) {
-            debug!("Using cached certificate for host: {}", host);
+        let mut cache = CERT_CACHE.write().unwrap();
+        if let Some((cert, created_time)) = cache.get(host) {
+            let age = created_time.elapsed();
             
-            // 깊은 복사 수행 - 인증서 체인은 클론 가능
-            let cert_chain = cert.0.clone();
-            
-            // 개인 키는 직접 복제해야 함
-            let private_key = match &cert.1 {
-                PrivateKeyDer::Pkcs8(key) => {
-                    let key_data = key.secret_pkcs8_der().to_vec();
-                    PrivateKeyDer::Pkcs8(key_data.into())
-                },
-                PrivateKeyDer::Sec1(key) => {
-                    let key_data = key.secret_sec1_der().to_vec();
-                    PrivateKeyDer::Sec1(key_data.into())
-                },
-                PrivateKeyDer::Pkcs1(key) => {
-                    let key_data = key.secret_pkcs1_der().to_vec();
-                    PrivateKeyDer::Pkcs1(key_data.into())
-                },
-                _ => return Err("Unsupported private key format".into()),
-            };
-            
-            return Ok((cert_chain, private_key));
+            // 인증서가 만료되지 않았고 유효 기간의 80% 미만인 경우에만 재사용
+            if age < Duration::from_secs(60 * 60 * 24 * 365 * 0.8 as u64) {
+                debug!("Using cached certificate for host: {} (age: {}s)", host, age.as_secs());
+                
+                // 깊은 복사 수행 - 인증서 체인은 클론 가능
+                let cert_chain = cert.0.clone();
+                
+                // 개인 키는 직접 복제해야 함
+                let private_key = match &cert.1 {
+                    PrivateKeyDer::Pkcs8(key) => {
+                        let key_data = key.secret_pkcs8_der().to_vec();
+                        PrivateKeyDer::Pkcs8(key_data.into())
+                    },
+                    PrivateKeyDer::Sec1(key) => {
+                        let key_data = key.secret_sec1_der().to_vec();
+                        PrivateKeyDer::Sec1(key_data.into())
+                    },
+                    PrivateKeyDer::Pkcs1(key) => {
+                        let key_data = key.secret_pkcs1_der().to_vec();
+                        PrivateKeyDer::Pkcs1(key_data.into())
+                    },
+                    _ => return Err("Unsupported private key format".into()),
+                };
+                
+                return Ok((cert_chain, private_key));
+            } else {
+                debug!("Certificate for {} is too old ({}s), regenerating", host, age.as_secs());
+                // 오래된 인증서는 제거하고 새로 생성
+                cache.pop(host);
+            }
         }
     }
     
@@ -168,7 +188,7 @@ pub async fn generate_fake_cert(host: &str) -> Result<CertKeyPair, Box<dyn Error
     
     let private_key = PrivateKeyDer::Pkcs8(key_der.into());
     
-    // 인증서를 캐시에 저장
+    // 인증서를 캐시에 저장 - Instant 추가
     let private_key_for_cache = match &private_key {
         PrivateKeyDer::Pkcs8(key) => {
             let key_data = key.secret_pkcs8_der().to_vec();
@@ -188,20 +208,20 @@ pub async fn generate_fake_cert(host: &str) -> Result<CertKeyPair, Box<dyn Error
     let cert_key_pair = (cert_chain.clone(), private_key_for_cache);
     {
         let mut cache = CERT_CACHE.write().unwrap();
-        cache.insert(host.to_string(), cert_key_pair);
+        cache.put(host.to_string(), (cert_key_pair, Instant::now()));
     }
     
     Ok((cert_chain, private_key))
 }
 
-/// 클라이언트와 TLS 연결을 수립합니다
+/// 클라이언트와 TLS 연결을 수립합니다 - 세션 재사용 지원
 pub async fn accept_tls_with_cert(
     tcp_stream: TcpStream,
     cert_key_pair: CertKeyPair
 ) -> Result<ServerTlsStream<TcpStream>, Box<dyn Error + Send + Sync>> {
     let (certs, key) = cert_key_pair;
     
-    // 서버 설정 구성
+    // 서버 설정 구성 - 세션 재사용 지원
     let server_config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
@@ -210,7 +230,8 @@ pub async fn accept_tls_with_cert(
             e
         })?;
     
-    let acceptor = TlsAcceptor::from(Arc::new(server_config));
+    let server_config = Arc::new(server_config);
+    let acceptor = TlsAcceptor::from(server_config);
     
     // TLS 핸드셰이크 수행
     let tls_stream = acceptor.accept(tcp_stream).await.map_err(|e| {
@@ -221,124 +242,186 @@ pub async fn accept_tls_with_cert(
     Ok(tls_stream)
 }
 
-/// 실제 서버와 TLS 연결을 수립합니다
+/// 실제 서버와 TLS 연결을 수립합니다 - 세션 재사용 개선
 pub async fn connect_tls(host: &str, config: &Config) -> Result<ClientTlsStream<TcpStream>, Box<dyn Error + Send + Sync>> {
-    // 클라이언트 설정 구성
-    let client_config = if config.tls_verify_certificate {
-        debug!("TLS certificate verification enabled - using system root certificates");
-        
-        // 시스템의 루트 인증서 로드
-        let mut root_store = rustls::RootCertStore::empty();
-        
-        let certs = rustls_native_certs::load_native_certs()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to load native certs: {}", e)))?;
-
-        for cert in certs {
-            root_store.add(cert)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to add cert to store: {:?}", e)))?;
+    // 캐시된 클라이언트 설정 사용
+    let client_config = {
+        let configs = CLIENT_TLS_CONFIGS.read().unwrap();
+        if let Some(config) = configs.get(&config.tls_verify_certificate) {
+            Arc::clone(config)
+        } else {
+            drop(configs); // 읽기 락 해제
+            
+            // 새 클라이언트 설정 생성
+            let new_config = if config.tls_verify_certificate {
+                create_verified_client_config()?
+            } else {
+                create_unverified_client_config()?
+            };
+            
+            // 캐시에 저장
+            let mut configs = CLIENT_TLS_CONFIGS.write().unwrap();
+            let config_arc = Arc::new(new_config);
+            configs.insert(config.tls_verify_certificate, Arc::clone(&config_arc));
+            config_arc
         }
-
-        debug!("Loaded {} native root certificates", root_store.len());
-        
-        ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth()
-    } else {
-        // 인증서 검증 비활성화
-        warn!("TLS certificate verification DISABLED! This is insecure and should only be used for testing.");
-        
-        // rustls 0.22.x 버전에서는 다음과 같이 인증서 검증을 비활성화
-        use rustls::client::danger::ServerCertVerified;
-        use rustls::client::danger::ServerCertVerifier;
-        use rustls::pki_types::UnixTime;
-        use rustls::DigitallySignedStruct;
-        use rustls::SignatureScheme;
-        
-        // 인증서 검증을 항상 통과시키는 검증기 구현
-        #[derive(Debug)]
-        struct SkipCertificationVerification;
-        
-        impl ServerCertVerifier for SkipCertificationVerification {
-            fn verify_server_cert(
-                &self,
-                _end_entity: &CertificateDer<'_>,
-                _intermediates: &[CertificateDer<'_>],
-                _server_name: &rustls::pki_types::ServerName<'_>,
-                _ocsp: &[u8],
-                _now: UnixTime,
-            ) -> Result<ServerCertVerified, rustls::Error> {
-                Ok(ServerCertVerified::assertion())
-            }
-            
-            fn verify_tls12_signature(
-                &self,
-                _message: &[u8],
-                _cert: &CertificateDer<'_>,
-                _dss: &DigitallySignedStruct,
-            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-            }
-            
-            fn verify_tls13_signature(
-                &self,
-                _message: &[u8],
-                _cert: &CertificateDer<'_>,
-                _dss: &DigitallySignedStruct,
-            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-            }
-            
-            fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-                // rustls 0.22.x에서는 이 방식으로 지원되는 서명 방식을 가져옴
-                vec![
-                    SignatureScheme::RSA_PKCS1_SHA256,
-                    SignatureScheme::RSA_PKCS1_SHA384,
-                    SignatureScheme::RSA_PKCS1_SHA512,
-                    SignatureScheme::ECDSA_NISTP256_SHA256,
-                    SignatureScheme::ECDSA_NISTP384_SHA384,
-                    SignatureScheme::ECDSA_NISTP521_SHA512,
-                    SignatureScheme::RSA_PSS_SHA256,
-                    SignatureScheme::RSA_PSS_SHA384,
-                    SignatureScheme::RSA_PSS_SHA512,
-                    SignatureScheme::ED25519,
-                ]
-            }
-        }
-        
-        let mut config = ClientConfig::builder()
-            .with_root_certificates(rustls::RootCertStore::empty())
-            .with_no_client_auth();
-            
-        // 인증서 검증을 건너뛰는 커스텀 검증기 설정
-        config.dangerous().set_certificate_verifier(Arc::new(SkipCertificationVerification));
-        
-        config
     };
     
-    let connector = TlsConnector::from(Arc::new(client_config));
+    // 호스트명으로 서버 이름 생성 - 문자열 복사하여 'static 라이프타임 문제 해결
+    let server_name = host.to_string().try_into()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Invalid DNS name: {}", e)))?;
     
-    // 서버에 연결
-    let tcp_stream = TcpStream::connect(format!("{}:443", host)).await?;
+    // TLS 커넥터 생성
+    let connector = TlsConnector::from(client_config);
     
-    // 연결된 실제 IP 주소 로깅
-    if let Ok(peer_addr) = tcp_stream.peer_addr() {
-        info!("Connected to IP: {} for host: {}", peer_addr.ip(), host);
-    }
+    // 세션 캐시에서 기존 세션 검색
+    let _session_data = {
+        let mut cache = TLS_SESSION_CACHE.write().unwrap();
+        cache.get(host).cloned()
+    };
     
-    // TLS 핸드셰이크 수행
-    let domain = rustls::pki_types::ServerName::try_from(host)
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid DNS name"))?
-        .to_owned();
+    // 서버 연결
+    let tcp_stream = TcpStream::connect(format!("{}:443", host)).await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to connect to {}: {}", host, e)))?;
     
-    let tls_stream = connector.connect(domain, tcp_stream).await.map_err(|e| {
-        // UnknownIssuer 오류인 경우 더 자세한 설명 로깅
-        if e.to_string().contains("UnknownIssuer") {
-            error!("TLS connection to server '{}' failed because the server's certificate is not trusted. You can disable certificate verification for testing purposes by setting tls_verify_certificate=false in your config.", host);
-        } else {
-            error!("TLS connection to server '{}' failed: {}", host, e);
-        }
-        e
-    })?;
+    // TCP 소켓 최적화
+    set_tcp_socket_options(&tcp_stream)?;
+    
+    // TLS 핸드셰이크
+    let tls_stream = connector.connect(server_name, tcp_stream).await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("TLS handshake with {} failed: {}", host, e)))?;
+    
+    // TODO: TLS 세션 데이터 추출 및 저장 구현
+    // 현재 rustls-0.22 는 직접적인 세션 데이터 액세스를 제공하지 않음
+    // 향후 세션 추출 메서드가 추가되면 구현
     
     Ok(tls_stream)
+}
+
+/// TCP 소켓 최적화 설정을 적용합니다
+fn set_tcp_socket_options(stream: &TcpStream) -> Result<(), std::io::Error> {
+    use std::os::unix::io::AsRawFd;
+    
+    let fd = stream.as_raw_fd();
+    
+    // TCP_NODELAY 설정
+    if TCP_NODELAY {
+        stream.set_nodelay(true)?;
+    }
+    
+    // TCP_QUICKACK 설정 (Linux 전용)
+    #[cfg(target_os = "linux")]
+    {
+        if TCP_QUICKACK {
+            let optval: libc::c_int = 1;
+            unsafe {
+                if libc::setsockopt(
+                    fd,
+                    libc::IPPROTO_TCP,
+                    libc::TCP_QUICKACK,
+                    &optval as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&optval) as libc::socklen_t,
+                ) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+// 인증서 검증이 활성화된 클라이언트 설정 생성
+fn create_verified_client_config() -> Result<ClientConfig, Box<dyn Error + Send + Sync>> {
+    debug!("TLS certificate verification enabled - using system root certificates");
+    
+    // 시스템의 루트 인증서 로드
+    let mut root_store = rustls::RootCertStore::empty();
+    
+    let certs = rustls_native_certs::load_native_certs()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to load native certs: {}", e)))?;
+
+    for cert in certs {
+        root_store.add(cert)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to add cert to store: {:?}", e)))?;
+    }
+
+    debug!("Loaded {} native root certificates", root_store.len());
+    
+    let client_config = ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    
+    Ok(client_config)
+}
+
+// 인증서 검증이 비활성화된 클라이언트 설정 생성
+fn create_unverified_client_config() -> Result<ClientConfig, Box<dyn Error + Send + Sync>> {
+    // 인증서 검증 비활성화
+    warn!("TLS certificate verification DISABLED! This is insecure and should only be used for testing.");
+    
+    // 인증서 검증을 항상 통과시키는 검증기 구현
+    use rustls::client::danger::ServerCertVerified;
+    use rustls::client::danger::ServerCertVerifier;
+    use rustls::pki_types::UnixTime;
+    use rustls::DigitallySignedStruct;
+    use rustls::SignatureScheme;
+    
+    // 인증서 검증을 항상 통과시키는 검증기 구현
+    #[derive(Debug)]
+    struct SkipCertificationVerification;
+    
+    impl ServerCertVerifier for SkipCertificationVerification {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+        
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            // rustls 0.22.x에서는 이 방식으로 지원되는 서명 방식을 가져옴
+            vec![
+                SignatureScheme::RSA_PKCS1_SHA256,
+                SignatureScheme::RSA_PKCS1_SHA384,
+                SignatureScheme::RSA_PKCS1_SHA512,
+                SignatureScheme::ECDSA_NISTP256_SHA256,
+                SignatureScheme::ECDSA_NISTP384_SHA384,
+                SignatureScheme::ECDSA_NISTP521_SHA512,
+                SignatureScheme::RSA_PSS_SHA256,
+                SignatureScheme::RSA_PSS_SHA384,
+                SignatureScheme::RSA_PSS_SHA512,
+                SignatureScheme::ED25519,
+            ]
+        }
+    }
+    
+    let client_config = ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(SkipCertificationVerification))
+        .with_no_client_auth();
+    
+    Ok(client_config)
 }

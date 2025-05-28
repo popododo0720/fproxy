@@ -14,9 +14,14 @@ pub const BUFFER_STATS_INTERVAL_SECS: u64 = 5;     // 버퍼 통계 출력
 pub const TCP_NODELAY: bool = true;
 // pub const TCP_KEEPALIVE_SECS: u32 = 60;
 // pub const TCP_FASTOPEN: bool = true;
-// pub const TCP_QUICKACK: bool = true;
-// pub const USE_SPLICE: bool = true; // 제로 카피 활성화
+pub const TCP_QUICKACK: bool = true;  // TCP 빠른 ACK 활성화
+pub const USE_SPLICE: bool = true;    // 제로 카피 활성화
 
+// LRU 캐시 크기
+pub const CERT_CACHE_SIZE: usize = 1000;         // 인증서 캐시 크기
+pub const TLS_SESSION_CACHE_SIZE: usize = 5000;  // TLS 세션 캐시 크기
+// pub const DNS_CACHE_SIZE: usize = 5000;          // DNS 캐시 크기
+// pub const ACL_CACHE_SIZE: usize = 10000;         // ACL 결과 캐시 크기
 
 // 루트 CA 인증서 파일 경로
 pub const CA_CERT_FILE: &str = "ssl/ca_cert.pem";
