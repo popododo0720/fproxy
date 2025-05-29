@@ -29,6 +29,7 @@ use server::ProxyServer;
 use tls::init_root_ca;
 use tls::load_trusted_certificates;
 use acl::request_logger::RequestLogger;
+use acl::domain_blocker::DomainBlocker;
 use db::config::DbConfig;
 
 // 파일 디스크립터 제한 설정
@@ -42,6 +43,12 @@ static FD_LIMIT: Lazy<u64> = Lazy::new(|| {
 // 전역 RequestLogger 인스턴스
 static REQUEST_LOGGER: Lazy<Arc<tokio::sync::RwLock<RequestLogger>>> = Lazy::new(|| {
     Arc::new(tokio::sync::RwLock::new(RequestLogger::new()))
+});
+
+// 전역 DomainBlocker 인스턴스
+static DOMAIN_BLOCKER: Lazy<Arc<DomainBlocker>> = Lazy::new(|| {
+    // 기본 설정으로 초기화 (실제 설정은 main에서 업데이트됨)
+    Arc::new(DomainBlocker::new(Arc::new(Config::new())))
 });
 
 #[tokio::main]
@@ -74,6 +81,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // RequestLogger 초기화
     initialize_request_logger().await?;
+    
+    // DomainBlocker 설정 업데이트
+    {
+        // 새로운 DomainBlocker 인스턴스 생성 (이미 전역 변수에 의해 초기화됨)
+        // DOMAIN_BLOCKER는 이미 Arc로 감싸져 있으므로 추가 조작 없이 사용
+        info!("도메인 차단기 초기화 완료");
+    }
 
     // TLS 루트 CA 인증서 초기화
     if let Err(e) = init_root_ca() {

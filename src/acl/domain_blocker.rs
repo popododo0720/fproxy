@@ -48,7 +48,7 @@ impl DomainBlocker {
                     if let Err(e) = Self::load_blocked_domains_from_db().await {
                         error!("DB에서 도메인 차단 목록 로드 실패: {}", e);
                     } else {
-                        info!("DB에서 도메인 차단 목록 로드 완료");
+                        debug!("DB에서 도메인 차단 목록 로드 완료");
                     }
                     
                     // 주기적으로 도메인 차단 목록 갱신 (10분 간격)
@@ -383,7 +383,7 @@ impl DomainBlocker {
         }
         
         let total_count = exact_domains.len() + suffix_patterns.len();
-        info!("DB에서 {} 개의 차단 도메인 로드 완료 (정확한 도메인: {}, 와일드카드 패턴: {})", 
+        debug!("DB에서 {} 개의 차단 도메인 로드 완료 (정확한 도메인: {}, 와일드카드 패턴: {})", 
              total_count, exact_domains.len(), suffix_patterns.len());
         
         Ok(())
