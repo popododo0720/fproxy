@@ -51,8 +51,8 @@ impl Config {
         Self {
             bind_host: "0.0.0.0".to_string(),
             bind_port: 50000,
-            buffer_size: 8192,
-            timeout_ms: 30000,
+            buffer_size: 32768,
+            timeout_ms: 60000,
             ssl_dir: "ssl".to_string(),
             worker_threads: None,
             tls_verify_certificate: true,

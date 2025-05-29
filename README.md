@@ -30,10 +30,10 @@ cargo build --release
 
 ### 기본 설정
 ```yaml
-bind_host: "0.0.0.0"
+bind_host: "192.168.0.40"
 bind_port: 50000
-buffer_size: 8192
-timeout_ms: 30000   # 30초
+buffer_size: 32768 # 16kb 이상 사용 권장
+timeout_ms: 60000   # 60초
 ssl_dir: "ssl"
 worker_threads: null  # null - 시스템 코어 수만큼 사용
 cache_enabled: true

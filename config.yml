@@ -1,9 +1,9 @@
 # 이 설정 파일이 없으면 기본값을 사용합니다.
 # 환경변수 CONFIG_FILE로 다른 경로를 지정할 수 있습니다.
 
-bind_host: "0.0.0.0"
+bind_host: "192.168.0.40"
 bind_port: 50000
-buffer_size: 16384
+buffer_size: 32768
 timeout_ms: 60000   # 60초
 ssl_dir: "ssl"
 worker_threads: null  # null - 시스템 코어 수만큼 사용
