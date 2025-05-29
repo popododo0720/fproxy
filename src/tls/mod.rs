@@ -16,6 +16,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use once_cell::sync::Lazy;
 use lru::LruCache;
 use nix::libc;
+use rustls_pemfile;
 
 use crate::constants::*;
 use crate::config::Config;
@@ -33,7 +34,8 @@ static TLS_SESSION_CACHE: Lazy<RwLock<LruCache<String, Vec<u8>>>> =
     Lazy::new(|| RwLock::new(LruCache::new(NonZeroUsize::new(TLS_SESSION_CACHE_SIZE).unwrap_or(NonZeroUsize::new(5000).unwrap()))));
 
 // 클라이언트 TLS 설정 캐시 (재사용을 위함)
-static CLIENT_TLS_CONFIGS: Lazy<RwLock<HashMap<bool, Arc<ClientConfig>>>> =
+type ConfigKey = (bool, Vec<String>);
+static CLIENT_TLS_CONFIGS: Lazy<RwLock<HashMap<ConfigKey, Arc<ClientConfig>>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
 /// 루트 CA 인증서를 초기화합니다
@@ -159,7 +161,16 @@ pub async fn generate_fake_cert(host: &str) -> Result<CertKeyPair, Box<dyn Error
     params.distinguished_name = distinguished_name;
     
     // SAN(Subject Alternative Name) 추가
-    params.subject_alt_names = vec![SanType::DnsName(host.to_string())];
+    let mut subject_alt_names = vec![SanType::DnsName(host.to_string())];
+    
+    // IP 주소인 경우 IP SAN 추가
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        info!("IP 주소 인증서 생성: {}", host);
+        // SanType::IpAddress는 IpAddr 타입을 직접 받음
+        subject_alt_names.push(SanType::IpAddress(ip));
+    }
+    
+    params.subject_alt_names = subject_alt_names;
     
     // 인증서 생성
     let cert = Certificate::from_params(params).map_err(|e| {
@@ -244,31 +255,57 @@ pub async fn accept_tls_with_cert(
 
 /// 실제 서버와 TLS 연결을 수립합니다 - 세션 재사용 개선
 pub async fn connect_tls(host: &str, config: &Config) -> Result<ClientTlsStream<TcpStream>, Box<dyn Error + Send + Sync>> {
+    // 포트 번호가 포함된 경우 분리
+    let (host_only, port) = if let Some(idx) = host.rfind(':') {
+        let (h, p) = host.split_at(idx);
+        (h, p[1..].parse::<u16>().unwrap_or(443))
+    } else {
+        (host, 443)
+    };
+    
+    // 추가 디버그 로그
+    info!("TLS 연결 시도: {}:{}, 인증서 검증: {}", host_only, port, if config.tls_verify_certificate { "활성화" } else { "비활성화" });
+    if !config.tls_verify_certificate {
+        info!("인증서 검증이 비활성화되어 있으나 연결 실패할 경우 디버그를 위해 추가 설정을 확인하세요");
+    } else {
+        info!("신뢰할 인증서 목록: {:?}", config.trusted_certificates);
+    }
+
+    // 내부 IP 주소에 대한 인증서 검증 설정에 따라 처리
+    let should_verify = if config.disable_verify_internal_ip && is_internal_ip(host_only) {
+        info!("내부 IP 주소 ({})에 대해 인증서 검증이 자동으로 비활성화되었습니다", host_only);
+        false
+    } else {
+        config.tls_verify_certificate
+    };
+
     // 캐시된 클라이언트 설정 사용
     let client_config = {
         let configs = CLIENT_TLS_CONFIGS.read().unwrap();
-        if let Some(config) = configs.get(&config.tls_verify_certificate) {
-            Arc::clone(config)
+        if let Some(cached_config) = configs.get(&(should_verify, config.trusted_certificates.clone())) {
+            Arc::clone(cached_config)
         } else {
             drop(configs); // 읽기 락 해제
             
-            // 새 클라이언트 설정 생성
-            let new_config = if config.tls_verify_certificate {
-                create_verified_client_config()?
+            // 설정값에 따라 클라이언트 설정 생성
+            let new_config = if should_verify {
+                info!("TLS certificate verification enabled for host: {}", host_only);
+                create_verified_client_config(config)?
             } else {
+                info!("TLS certificate verification disabled for host: {}", host_only);
                 create_unverified_client_config()?
             };
             
             // 캐시에 저장
             let mut configs = CLIENT_TLS_CONFIGS.write().unwrap();
             let config_arc = Arc::new(new_config);
-            configs.insert(config.tls_verify_certificate, Arc::clone(&config_arc));
+            configs.insert((should_verify, config.trusted_certificates.clone()), Arc::clone(&config_arc));
             config_arc
         }
     };
     
     // 호스트명으로 서버 이름 생성 - 문자열 복사하여 'static 라이프타임 문제 해결
-    let server_name = host.to_string().try_into()
+    let server_name = host_only.to_string().try_into()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Invalid DNS name: {}", e)))?;
     
     // TLS 커넥터 생성
@@ -277,23 +314,29 @@ pub async fn connect_tls(host: &str, config: &Config) -> Result<ClientTlsStream<
     // 세션 캐시에서 기존 세션 검색
     let _session_data = {
         let mut cache = TLS_SESSION_CACHE.write().unwrap();
-        cache.get(host).cloned()
+        cache.get(host_only).cloned()
     };
     
-    // 서버 연결
-    let tcp_stream = TcpStream::connect(format!("{}:443", host)).await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to connect to {}: {}", host, e)))?;
+    // 서버 연결 - 포트 번호 사용
+    let tcp_stream = TcpStream::connect(format!("{}:{}", host_only, port)).await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to connect to {}:{}: {}", host_only, port, e)))?;
     
     // TCP 소켓 최적화
     set_tcp_socket_options(&tcp_stream)?;
     
     // TLS 핸드셰이크
     let tls_stream = connector.connect(server_name, tcp_stream).await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("TLS handshake with {} failed: {}", host, e)))?;
-    
-    // TODO: TLS 세션 데이터 추출 및 저장 구현
-    // 현재 rustls-0.22 는 직접적인 세션 데이터 액세스를 제공하지 않음
-    // 향후 세션 추출 메서드가 추가되면 구현
+        .map_err(|e| {
+            if !config.tls_verify_certificate {
+                error!("TLS handshake failed even with verification disabled: {}", e);
+                error!("상세 오류: {:?}", e);
+                error!("이 경우 서버 측에서 지원하는 TLS 버전이나 암호화 알고리즘이 호환되지 않을 수 있습니다.");
+                error!("서버 로그를 확인하고, 서버 TLS 설정을 점검하세요.");
+            } else {
+                error!("TLS handshake failed with verification enabled: {}", e);
+            }
+            std::io::Error::new(std::io::ErrorKind::Other, format!("TLS handshake with {}:{} failed: {}", host_only, port, e))
+        })?;
     
     Ok(tls_stream)
 }
@@ -332,22 +375,57 @@ fn set_tcp_socket_options(stream: &TcpStream) -> Result<(), std::io::Error> {
 }
 
 // 인증서 검증이 활성화된 클라이언트 설정 생성
-fn create_verified_client_config() -> Result<ClientConfig, Box<dyn Error + Send + Sync>> {
+fn create_verified_client_config(config: &Config) -> Result<ClientConfig, Box<dyn Error + Send + Sync>> {
     debug!("TLS certificate verification enabled - using system root certificates");
     
     // 시스템의 루트 인증서 로드
     let mut root_store = rustls::RootCertStore::empty();
     
+    // 1. 시스템 인증서 로드
     let certs = rustls_native_certs::load_native_certs()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to load native certs: {}", e)))?;
 
+    let mut cert_count = 0;
     for cert in certs {
-        root_store.add(cert)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to add cert to store: {:?}", e)))?;
+        if root_store.add(cert).is_ok() {
+            cert_count += 1;
+        }
+    }
+    debug!("Loaded {} native root certificates", cert_count);
+    
+    // 2. 사용자 지정 인증서 로드 (추가 신뢰 인증서)
+    let mut custom_cert_count = 0;
+    for cert_path in &config.trusted_certificates {
+        debug!("Loading custom certificate from: {}", cert_path);
+        
+        // PEM 또는 DER 형식 인증서 로드 시도
+        if let Ok(cert_data) = fs::read(cert_path) {
+            if cert_path.ends_with(".pem") || cert_path.ends_with(".crt") {
+                // PEM 형식 처리
+                let mut cert_data_slice = cert_data.as_slice();
+                let cert_iter = rustls_pemfile::certs(&mut cert_data_slice);
+                for cert_result in cert_iter {
+                    if let Ok(cert) = cert_result {
+                        if root_store.add(cert).is_ok() {
+                            custom_cert_count += 1;
+                        }
+                    }
+                }
+            } else {
+                // DER 형식으로 가정하고 처리 시도
+                if let Ok(_) = root_store.add(CertificateDer::from(cert_data)) {
+                    custom_cert_count += 1;
+                }
+            }
+        } else {
+            warn!("Failed to read certificate file: {}", cert_path);
+        }
+    }
+    
+    if custom_cert_count > 0 {
+        info!("Loaded {} additional trusted certificates", custom_cert_count);
     }
 
-    debug!("Loaded {} native root certificates", root_store.len());
-    
     let client_config = ClientConfig::builder()
         .with_root_certificates(root_store)
         .with_no_client_auth();
@@ -358,28 +436,32 @@ fn create_verified_client_config() -> Result<ClientConfig, Box<dyn Error + Send 
 // 인증서 검증이 비활성화된 클라이언트 설정 생성
 fn create_unverified_client_config() -> Result<ClientConfig, Box<dyn Error + Send + Sync>> {
     // 인증서 검증 비활성화
-    warn!("TLS certificate verification DISABLED! This is insecure and should only be used for testing.");
+    warn!("TLS certificate verification COMPLETELY DISABLED! All certificates will be trusted.");
+    info!("인증서 검증 비활성화 모드로 TLS 설정 생성 중...");
     
-    // 인증서 검증을 항상 통과시키는 검증기 구현
-    use rustls::client::danger::ServerCertVerified;
+    // 모든 인증서를 항상 신뢰하는 검증기 구현
     use rustls::client::danger::ServerCertVerifier;
+    use rustls::client::danger::{ServerCertVerified, HandshakeSignatureValid};
+    use rustls::pki_types::ServerName;
     use rustls::pki_types::UnixTime;
     use rustls::DigitallySignedStruct;
     use rustls::SignatureScheme;
     
-    // 인증서 검증을 항상 통과시키는 검증기 구현
+    // 모든 인증서를 항상 무조건 신뢰하는 검증기 구현
     #[derive(Debug)]
-    struct SkipCertificationVerification;
+    struct NoCertificateVerification;
     
-    impl ServerCertVerifier for SkipCertificationVerification {
+    impl ServerCertVerifier for NoCertificateVerification {
         fn verify_server_cert(
             &self,
             _end_entity: &CertificateDer<'_>,
             _intermediates: &[CertificateDer<'_>],
-            _server_name: &rustls::pki_types::ServerName<'_>,
+            server_name: &ServerName<'_>,
             _ocsp: &[u8],
             _now: UnixTime,
         ) -> Result<ServerCertVerified, rustls::Error> {
+            // 무조건 통과
+            info!("인증서 검증 비활성화: 서버 {:?} 인증서 검증 없이 통과 처리됨", server_name);
             Ok(ServerCertVerified::assertion())
         }
         
@@ -388,8 +470,9 @@ fn create_unverified_client_config() -> Result<ClientConfig, Box<dyn Error + Sen
             _message: &[u8],
             _cert: &CertificateDer<'_>,
             _dss: &DigitallySignedStruct,
-        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            // 무조건 통과
+            Ok(HandshakeSignatureValid::assertion())
         }
         
         fn verify_tls13_signature(
@@ -397,12 +480,13 @@ fn create_unverified_client_config() -> Result<ClientConfig, Box<dyn Error + Sen
             _message: &[u8],
             _cert: &CertificateDer<'_>,
             _dss: &DigitallySignedStruct,
-        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            // 무조건 통과
+            Ok(HandshakeSignatureValid::assertion())
         }
         
         fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-            // rustls 0.22.x에서는 이 방식으로 지원되는 서명 방식을 가져옴
+            // 모든 지원 가능한 서명 방식 반환
             vec![
                 SignatureScheme::RSA_PKCS1_SHA256,
                 SignatureScheme::RSA_PKCS1_SHA384,
@@ -418,10 +502,141 @@ fn create_unverified_client_config() -> Result<ClientConfig, Box<dyn Error + Sen
         }
     }
     
+    // 모든 TLS 버전 지원 (TLS 1.2/1.3)
+    info!("모든 TLS 버전 지원 활성화 (TLS 1.2/1.3)");
+    
+    // rustls 0.23 버전에 맞는 방식으로 TLS 버전 설정
+    // ClientConfig 생성 - 간단한 방식으로 변경
     let client_config = ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(SkipCertificationVerification))
+        .with_custom_certificate_verifier(Arc::new(NoCertificateVerification {}))
         .with_no_client_auth();
     
+    // 직접 versions 필드에 접근하지 않고, 대신 기본 설정 사용
+    // TLS 1.3과 TLS 1.2가 기본적으로 지원됨
+    
+    info!("인증서 검증 비활성화 모드로 클라이언트 설정 생성 완료");
     Ok(client_config)
+}
+
+/// ssl/trusted_certs 폴더에서 인증서를 자동으로 로드합니다.
+pub fn load_trusted_certificates(config: &mut Config) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let trusted_certs_dir = format!("{}/trusted_certs", config.ssl_dir);
+    let trusted_certs_path = Path::new(&trusted_certs_dir);
+    
+    // 기존 trusted_certificates 배열 초기화 (폴더에서 모든 인증서를 다시 로드)
+    config.trusted_certificates.clear();
+    
+    if !trusted_certs_path.exists() {
+        debug!("신뢰할 인증서 폴더가 존재하지 않습니다: {}", trusted_certs_dir);
+        if let Err(e) = std::fs::create_dir_all(trusted_certs_path) {
+            warn!("신뢰할 인증서 폴더 생성 실패: {}", e);
+        } else {
+            info!("신뢰할 인증서 폴더 생성됨: {}", trusted_certs_dir);
+        }
+        return Ok(());
+    }
+    
+    // 폴더 내의 모든 파일 검색
+    if let Ok(entries) = std::fs::read_dir(trusted_certs_path) {
+        let mut loaded_count = 0;
+        
+        for entry in entries {
+            if let Ok(entry) = entry {
+                let path = entry.path();
+                
+                // 파일만 처리
+                if path.is_file() {
+                    let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+                    
+                    // .pem, .crt, .cer 파일만 처리
+                    if extension == "pem" || extension == "crt" || extension == "cer" {
+                        let path_str = path.to_string_lossy().to_string();
+                        
+                        // 설정에 추가
+                        config.trusted_certificates.push(path_str.clone());
+                        loaded_count += 1;
+                        debug!("신뢰할 인증서 추가됨: {}", path_str);
+                    }
+                }
+            }
+        }
+        
+        if loaded_count > 0 {
+            info!("ssl/trusted_certs에서 {} 개의 인증서가 자동으로 로드되었습니다", loaded_count);
+        } else {
+            debug!("ssl/trusted_certs 폴더에서 로드할 인증서가 없습니다");
+        }
+    }
+    
+    Ok(())
+}
+
+/// 주어진 호스트가 내부 IP 주소인지 확인합니다
+fn is_internal_ip(host: &str) -> bool {
+    debug!("is_internal_ip 확인: {}", host);
+    
+    // IP 주소 형식인지 확인
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        debug!("호스트 {}는 IP 주소 형식입니다: {:?}", host, ip);
+        
+        // IPv4 주소 확인
+        if let std::net::IpAddr::V4(ipv4) = ip {
+            // 사설 IP 범위 확인
+            // 10.0.0.0/8
+            if ipv4.octets()[0] == 10 {
+                debug!("호스트 {}는 10.0.0.0/8 범위의 내부 IP입니다", host);
+                return true;
+            }
+            
+            // 172.16.0.0/12
+            if ipv4.octets()[0] == 172 && (ipv4.octets()[1] >= 16 && ipv4.octets()[1] <= 31) {
+                debug!("호스트 {}는 172.16.0.0/12 범위의 내부 IP입니다", host);
+                return true;
+            }
+            
+            // 192.168.0.0/16
+            if ipv4.octets()[0] == 192 && ipv4.octets()[1] == 168 {
+                debug!("호스트 {}는 192.168.0.0/16 범위의 내부 IP입니다", host);
+                return true;
+            }
+            
+            // 127.0.0.0/8 (로컬호스트)
+            if ipv4.octets()[0] == 127 {
+                debug!("호스트 {}는 127.0.0.0/8 범위의 로컬호스트 IP입니다", host);
+                return true;
+            }
+            
+            debug!("호스트 {}는 내부 IP 범위에 포함되지 않습니다", host);
+        }
+        
+        // IPv6 로컬 주소 확인
+        if let std::net::IpAddr::V6(ipv6) = ip {
+            // ::1 (IPv6 로컬호스트)
+            if ipv6.is_loopback() {
+                debug!("호스트 {}는 IPv6 로컬호스트 주소입니다", host);
+                return true;
+            }
+            
+            // fe80::/10 (링크 로컬)
+            if ipv6.is_unicast_link_local() {
+                debug!("호스트 {}는 IPv6 링크 로컬 주소입니다", host);
+                return true;
+            }
+            
+            debug!("호스트 {}는 내부 IPv6 범위에 포함되지 않습니다", host);
+        }
+    } else {
+        debug!("호스트 {}는 IP 주소 형식이 아닙니다", host);
+    }
+    
+    // IP 주소가 아니라면 호스트명 확인
+    // localhost 또는 .local 도메인 확인
+    if host == "localhost" || host.ends_with(".local") {
+        debug!("호스트 {}는 내부 도메인 이름입니다", host);
+        return true;
+    }
+    
+    debug!("호스트 {}는 내부 IP 또는 내부 도메인으로 인식되지 않습니다", host);
+    false
 }

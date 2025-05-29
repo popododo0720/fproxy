@@ -1,3 +1,9 @@
+// SQL 쿼리 모듈 (테이블별 SQL 쿼리 관리)
+pub mod request_logs;
+pub mod proxy_stats;
+pub mod proxy_stats_hourly;
+pub mod partition;
+
 // 버퍼 크기
 pub const BUFFER_SIZE_SMALL: usize = 64 * 1024;   // 64KB
 pub const BUFFER_SIZE_MEDIUM: usize = 256 * 1024;    // 256KB

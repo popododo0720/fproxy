@@ -7,6 +7,7 @@ use log::{ info, debug, error, warn };
 use once_cell::sync::Lazy;
 use chrono::Utc;
 use chrono::Datelike;
+use chrono::Timelike;
 
 use crate::db;
 
@@ -16,6 +17,24 @@ static METRICS_INSTANCE: Lazy<Arc<Metrics>> = Lazy::new(|| {
     
     // 주기적인 통계 로깅 설정 (비활성화)
     // 주기적인 통계 로깅 코드 제거
+    
+    // 시간별 통계 테이블 초기화
+    let _metrics_clone = Arc::clone(&metrics);
+    tokio::spawn(async move {
+        // 시간별 통계 테이블 생성 확인
+        match db::query::QueryExecutor::get_instance().await {
+            Ok(executor) => {
+                if let Err(e) = Metrics::ensure_hourly_stats_table(&executor).await {
+                    error!("시간별 통계 테이블 초기화 실패: {}", e);
+                } else {
+                    info!("시간별 통계 테이블 초기화 완료");
+                }
+            },
+            Err(e) => {
+                error!("쿼리 실행기 가져오기 실패: {}", e);
+            }
+        }
+    });
     
     // 주기적인 DB 저장 설정 (1초마다)
     let metrics_clone = Arc::clone(&metrics);
@@ -28,6 +47,14 @@ static METRICS_INSTANCE: Lazy<Arc<Metrics>> = Lazy::new(|| {
         let mut interval = time::interval(Duration::from_secs(1));
         loop {
             interval.tick().await;
+            
+            // 매 시간 시작에 카운터 리셋
+            let now = Utc::now();
+            if now.minute() == 0 && now.second() == 0 {
+                debug!("매 시간 시작: 전송량 카운터 리셋");
+                metrics_clone.reset_transfer_counters();
+            }
+            
             if let Err(e) = metrics_clone.save_stats_to_db().await {
                 error!("메트릭스 통계 DB 저장 실패: {}", e);
             }
@@ -45,6 +72,7 @@ pub struct Metrics {
     tls_bytes_transferred_in: AtomicU64,
     tls_bytes_transferred_out: AtomicU64,
     start_time: Instant,
+    last_reset_time: std::sync::RwLock<Instant>,  // 마지막 리셋 시간
 }
 
 impl Metrics {
@@ -63,6 +91,7 @@ impl Metrics {
             tls_bytes_transferred_in: AtomicU64::new(0),
             tls_bytes_transferred_out: AtomicU64::new(0),
             start_time: Instant::now(),
+            last_reset_time: std::sync::RwLock::new(Instant::now()),  // 초기화
         }
     }
 
@@ -70,6 +99,167 @@ impl Metrics {
     fn bytes_to_mb(bytes: u64) -> f64 {
         let mb = bytes as f64 / (1024.0 * 1024.0);
         (mb * 1000.0).round() / 1000.0  // 소수점 세 자리로 제한
+    }
+    
+    // 전송량 카운터 리셋
+    fn reset_transfer_counters(&self) {
+        // 리셋 전에 현재 값을 시간별 통계로 저장
+        let metrics = self.load_all_metrics();
+        let metrics_clone = metrics.clone(); // 비동기 작업을 위한 복제
+        
+        // 비동기 작업으로 시간별 통계 저장
+        tokio::spawn(async move {
+            if let Err(e) = Self::save_hourly_stats(metrics_clone).await {
+                error!("시간별 통계 저장 실패: {}", e);
+            }
+        });
+        
+        // 카운터 리셋
+        self.http_bytes_transferred_in.store(0, Ordering::Relaxed);
+        self.http_bytes_transferred_out.store(0, Ordering::Relaxed);
+        self.tls_bytes_transferred_in.store(0, Ordering::Relaxed);
+        self.tls_bytes_transferred_out.store(0, Ordering::Relaxed);
+        
+        if let Ok(mut last_reset) = self.last_reset_time.write() {
+            *last_reset = Instant::now();
+        }
+        
+        info!("전송량 카운터가 리셋되었습니다.");
+    }
+    
+    // 시간별 통계 저장
+    async fn save_hourly_stats(metrics: MetricsSnapshot) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // 쿼리 실행기 가져오기
+        let executor = match db::query::QueryExecutor::get_instance().await {
+            Ok(executor) => executor,
+            Err(e) => {
+                error!("쿼리 실행기 가져오기 실패: {}", e);
+                return Err(e);
+            }
+        };
+        
+        // 시간별 통계 테이블 확인 및 생성
+        if let Err(e) = Self::ensure_hourly_stats_table(&executor).await {
+            error!("시간별 통계 테이블 생성 실패: {}", e);
+            return Err(e);
+        }
+        
+        // 현재 시간 (시간 단위로 절사)
+        let hour_start = Utc::now()
+            .with_minute(0).unwrap()
+            .with_second(0).unwrap()
+            .with_nanosecond(0).unwrap();
+        
+        // 바이트를 메가바이트로 변환
+        let http_bytes_in_mb = Self::bytes_to_mb(metrics.http_bytes_transferred_in);
+        let http_bytes_out_mb = Self::bytes_to_mb(metrics.http_bytes_transferred_out);
+        let tls_bytes_in_mb = Self::bytes_to_mb(metrics.tls_bytes_transferred_in);
+        let tls_bytes_out_mb = Self::bytes_to_mb(metrics.tls_bytes_transferred_out);
+        
+        // 시간별 통계 삽입 쿼리
+        let insert_query = "
+            INSERT INTO proxy_stats_hourly (
+                hour_start,
+                http_bytes_in,
+                http_bytes_out,
+                tls_bytes_in,
+                tls_bytes_out,
+                max_http_connections,
+                max_tls_connections
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7
+            )
+        ";
+        
+        // 쿼리 파라미터
+        let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
+            &hour_start,
+            &http_bytes_in_mb,
+            &http_bytes_out_mb,
+            &tls_bytes_in_mb,
+            &tls_bytes_out_mb,
+            &(metrics.http_active_connections as i64),
+            &(metrics.tls_active_connections as i64)
+        ];
+        
+        // 쿼리 실행
+        match executor.execute_query(insert_query, params).await {
+            Ok(_) => {
+                info!("시간별 통계 저장 완료: {}", hour_start);
+                Ok(())
+            },
+            Err(e) => {
+                error!("시간별 통계 저장 실패: {}", e);
+                Err(e.into())
+            }
+        }
+    }
+    
+    // 시간별 통계 테이블 생성 확인
+    async fn ensure_hourly_stats_table(executor: &db::query::QueryExecutor) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // 테이블 존재 여부 확인
+        let check_table_query = "
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_schema = 'public' 
+                AND table_name = 'proxy_stats_hourly'
+            );
+        ";
+        
+        let table_exists = match executor.query_one(check_table_query, &[], |row| Ok(row.get::<_, bool>(0))).await {
+            Ok(exists) => exists,
+            Err(e) => {
+                error!("테이블 존재 여부 확인 실패: {}", e);
+                false
+            }
+        };
+        
+        if !table_exists {
+            // 테이블 생성 쿼리
+            let create_table_query = "
+                CREATE TABLE IF NOT EXISTS proxy_stats_hourly (
+                    id SERIAL PRIMARY KEY,
+                    hour_start TIMESTAMPTZ NOT NULL,
+                    http_bytes_in DOUBLE PRECISION NOT NULL,
+                    http_bytes_out DOUBLE PRECISION NOT NULL,
+                    tls_bytes_in DOUBLE PRECISION NOT NULL,
+                    tls_bytes_out DOUBLE PRECISION NOT NULL,
+                    max_http_connections BIGINT NOT NULL,
+                    max_tls_connections BIGINT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            ";
+            
+            // 인덱스 생성 쿼리
+            let create_index_query = "
+                CREATE INDEX IF NOT EXISTS proxy_stats_hourly_hour_start_idx ON proxy_stats_hourly(hour_start)
+            ";
+            
+            // 테이블 생성
+            if let Err(e) = executor.execute_query(create_table_query, &[]).await {
+                error!("proxy_stats_hourly 테이블 생성 실패: {}", e);
+                return Err(e);
+            }
+            
+            // 인덱스 생성
+            if let Err(e) = executor.execute_query(create_index_query, &[]).await {
+                warn!("proxy_stats_hourly 인덱스 생성 실패: {}", e);
+                // 인덱스 생성 실패는 치명적이지 않으므로 계속 진행
+            }
+            
+            info!("proxy_stats_hourly 테이블이 성공적으로 생성되었습니다.");
+        }
+        
+        Ok(())
+    }
+    
+    // 마지막 리셋 이후 경과 시간(초)
+    fn seconds_since_last_reset(&self) -> u64 {
+        if let Ok(last_reset) = self.last_reset_time.read() {
+            last_reset.elapsed().as_secs()
+        } else {
+            0
+        }
     }
     
     // proxy_stats 테이블 생성 확인
@@ -118,6 +308,7 @@ impl Metrics {
                     tls_bytes_in DOUBLE PRECISION NOT NULL,
                     tls_bytes_out DOUBLE PRECISION NOT NULL,
                     uptime_seconds BIGINT NOT NULL,
+                    seconds_since_reset BIGINT NOT NULL DEFAULT 0,
                     PRIMARY KEY (id, timestamp)
                 ) PARTITION BY RANGE (timestamp)
             ";
@@ -245,9 +436,10 @@ impl Metrics {
                 tls_active_connections, 
                 tls_bytes_in, 
                 tls_bytes_out, 
-                uptime_seconds
+                uptime_seconds,
+                seconds_since_reset
             ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8
+                $1, $2, $3, $4, $5, $6, $7, $8, $9
             )
         ";
         
@@ -260,6 +452,9 @@ impl Metrics {
         let tls_bytes_in_mb = (Self::bytes_to_mb(metrics.tls_bytes_transferred_in) * 1000.0).round() / 1000.0;
         let tls_bytes_out_mb = (Self::bytes_to_mb(metrics.tls_bytes_transferred_out) * 1000.0).round() / 1000.0;
         
+        // 마지막 리셋 이후 경과 시간
+        let seconds_since_reset = self.seconds_since_last_reset() as i64;
+        
         // 쿼리 파라미터 (메가바이트 단위로 저장)
         let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
             &now,
@@ -269,7 +464,8 @@ impl Metrics {
             &(metrics.tls_active_connections as i64),
             &tls_bytes_in_mb,   // 메가바이트 단위
             &tls_bytes_out_mb,  // 메가바이트 단위
-            &(metrics.start_time as i64)
+            &(metrics.start_time as i64),
+            &seconds_since_reset // 마지막 리셋 이후 경과 시간
         ];
         
         // 쿼리 실행
@@ -386,5 +582,20 @@ struct MetricsSnapshot {
     tls_bytes_transferred_in: u64,
     tls_bytes_transferred_out: u64,
     start_time: u64,
+}
+
+// Clone 트레이트 구현
+impl Clone for MetricsSnapshot {
+    fn clone(&self) -> Self {
+        Self {
+            http_active_connections: self.http_active_connections,
+            http_bytes_transferred_in: self.http_bytes_transferred_in,
+            http_bytes_transferred_out: self.http_bytes_transferred_out,
+            tls_active_connections: self.tls_active_connections,
+            tls_bytes_transferred_in: self.tls_bytes_transferred_in,
+            tls_bytes_transferred_out: self.tls_bytes_transferred_out,
+            start_time: self.start_time,
+        }
+    }
 }
 

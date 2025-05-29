@@ -117,7 +117,7 @@ impl Session {
 
         if is_connect {
             // HTTPS 요청 처리
-            self.handle_https_request(client_stream, host, buffer).await
+            self.handle_https_request(client_stream, host, port, buffer).await
         } else {
             // HTTP 요청 처리
             self.handle_http_request(client_stream, host, port, &request_str, n, buffer).await
@@ -349,11 +349,11 @@ impl Session {
     }
     
     /// HTTPS 요청 처리
-    async fn handle_https_request(&self, mut client_stream: TcpStream, host: &str, buffer: BytesMut) -> Result<(), Box<dyn Error + Send + Sync>> {
+    async fn handle_https_request(&self, mut client_stream: TcpStream, host: &str, port: u16, buffer: BytesMut) -> Result<(), Box<dyn Error + Send + Sync>> {
         // CONNECT 요청에 대한 승인 응답 전송
         let response = "HTTP/1.1 200 Connection Established\r\nConnection: keep-alive\r\n\r\n";
         client_stream.write_all(response.as_bytes()).await?;
-        info!("[Session:{}] CONNECT request approved for {}", self.session_id(), host);
+        info!("[Session:{}] CONNECT request approved for {}:{}", self.session_id(), host, port);
         
         // 버퍼 반환
         if let Some(pool) = &self.buffer_pool {
@@ -367,10 +367,13 @@ impl Session {
         let tls_stream = accept_tls_with_cert(client_stream, fake_cert).await?;
         info!("[Session:{}] Established TLS with client for {}", self.session_id(), host);
         
+        // 호스트와 포트 조합
+        let host_port = format!("{}:{}", host, port);
+        
         // 2. 실제 서버와도 TLS 연결 - 설정 전달하여 인증서 검증 옵션 적용
-        match connect_tls(host, &self.config).await {
+        match connect_tls(&host_port, &self.config).await {
             Ok(real_tls_stream) => {
-                info!("[Session:{}] Connected to real server {} over TLS", self.session_id(), host);
+                info!("[Session:{}] Connected to real server {} over TLS", self.session_id(), host_port);
                 
                 // 3. 중간에서 데이터 가로채기 - 요청 시작 시간 전달
                 let request_start_time = Instant::now();

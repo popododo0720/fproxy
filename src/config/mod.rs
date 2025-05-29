@@ -12,12 +12,37 @@ pub struct Config {
     pub bind_port: u16,
     pub buffer_size: usize,
     pub timeout_ms: usize,
-    pub tls_inspection: bool,
     pub ssl_dir: String,
     pub worker_threads: Option<usize>,
     pub tls_verify_certificate: bool,
+    #[serde(default = "default_disable_verify_internal_ip")]
+    pub disable_verify_internal_ip: bool,
     pub blocked_domains: HashSet<String>,
     pub blocked_patterns: HashSet<String>,
+    #[serde(default)]
+    pub trusted_certificates: Vec<String>,
+    #[serde(default = "default_cache_enabled")]
+    pub cache_enabled: bool,
+    #[serde(default = "default_cache_size")]
+    pub cache_size: usize,
+    #[serde(default = "default_cache_ttl_seconds")]
+    pub cache_ttl_seconds: u64,
+}
+
+fn default_disable_verify_internal_ip() -> bool {
+    false
+}
+
+fn default_cache_enabled() -> bool {
+    true
+}
+
+fn default_cache_size() -> usize {
+    1000
+}
+
+fn default_cache_ttl_seconds() -> u64 {
+    300
 }
 
 impl Config {
@@ -28,29 +53,27 @@ impl Config {
             bind_port: 50000,
             buffer_size: 8192,
             timeout_ms: 30000,
-            tls_inspection: false,
             ssl_dir: "ssl".to_string(),
             worker_threads: None,
             tls_verify_certificate: true,
-            blocked_domains: Self::default_blocked_domains(),
-            blocked_patterns: Self::default_blocked_patterns(),
+            disable_verify_internal_ip: default_disable_verify_internal_ip(),
+            blocked_domains: HashSet::new(),
+            blocked_patterns: HashSet::new(),
+            trusted_certificates: Vec::new(),
+            cache_enabled: default_cache_enabled(),
+            cache_size: default_cache_size(),
+            cache_ttl_seconds: default_cache_ttl_seconds(),
         }
     }
 
     /// 기본 차단 도메인 목록 생성
     fn default_blocked_domains() -> HashSet<String> {
-        let mut domains = HashSet::new();
-        domains.insert("nexon.com".to_string());
-        // domains.insert("dongbangsystem.com".to_string());
-        domains
+        HashSet::new()
     }
 
     /// 기본 차단 패턴 목록 생성
     fn default_blocked_patterns() -> HashSet<String> {
-        let mut patterns = HashSet::new();
-        patterns.insert("*.nexon.com".to_string());
-        // patterns.insert("*.dongbangsystem.com".to_string());
-        patterns
+        HashSet::new()
     }
 
     /// 설정 파일에서 Config 인스턴스 로드
@@ -79,7 +102,7 @@ impl Config {
         self.blocked_domains.contains(domain) || 
         self.blocked_patterns.iter().any(|pattern| {
             if pattern.starts_with("*.") {
-                let suffix = &pattern[1..]; // "*.example.com" -> ".example.com"
+                let suffix = &pattern[1..]; 
                 domain.ends_with(suffix)
             } else {
                 false

@@ -27,6 +27,7 @@ use constants::*;
 use buffer::BufferPool;
 use server::ProxyServer;
 use tls::init_root_ca;
+use tls::load_trusted_certificates;
 use acl::request_logger::RequestLogger;
 use db::config::DbConfig;
 
@@ -56,10 +57,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     info!("시스템 코어 수: {}", num_cpus);
 
     // 프록시 설정 로드
-    let config = load_config()?;
+    let mut config = load_config()?;
     
     // 데이터베이스 설정 로드 및 초기화
     setup_database().await?;
+
+    // SSL 디렉토리 확인 및 생성
+    ensure_ssl_directories(&config)?;
 
     // 메트릭스 초기화
     let metrics = Metrics::new();
@@ -76,6 +80,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         error!("루트 CA 초기화 실패: {}", e);
     } else {
         info!("루트 CA 초기화 성공");
+    }
+    
+    // ssl/trusted_certs 폴더에서 신뢰할 인증서 자동 로드
+    if let Err(e) = load_trusted_certificates(Arc::get_mut(&mut config).unwrap()) {
+        error!("신뢰할 인증서 로드 실패: {}", e);
     }
 
     // 워커 스레드 설정
@@ -136,18 +145,23 @@ fn setup_resource_limits() {
 
 /// 설정 파일 로드
 fn load_config() -> Result<Arc<Config>, Box<dyn Error>> {
-    let config = match std::env::var("CONFIG_FILE") {
+    // 먼저 현재 디렉토리의 config.yml 파일 확인
+    if Path::new("config.yml").exists() {
+        info!("설정 파일 로드: config.yml");
+        return Ok(Arc::new(Config::from_file("config.yml")?));
+    }
+    
+    // 환경 변수에서 설정 파일 경로 확인
+    match std::env::var("CONFIG_FILE") {
         Ok(path) => {
-            info!("설정 파일 로드: {}", path);
-            Arc::new(Config::from_file(&path)?)
+            info!("환경 변수에서 설정 파일 로드: {}", path);
+            Ok(Arc::new(Config::from_file(&path)?))
         },
         Err(_) => {
-            info!("기본 설정 사용");
-            Arc::new(Config::new())
+            info!("설정 파일을 찾을 수 없어 기본 설정 사용");
+            Ok(Arc::new(Config::new()))
         }
-    };
-    
-    Ok(config)
+    }
 }
 
 /// 데이터베이스 설정 및 초기화
@@ -220,6 +234,33 @@ async fn initialize_database() -> Result<(), Box<dyn Error>> {
         Err(_) => {
             debug!("데이터베이스 파티션 확인 타임아웃, 계속 진행합니다");
         }
+    }
+    
+    Ok(())
+}
+
+/// SSL 디렉토리 확인 및 생성
+fn ensure_ssl_directories(config: &Config) -> Result<(), Box<dyn Error>> {
+    // SSL 디렉토리 확인
+    let ssl_dir = Path::new(&config.ssl_dir);
+    if !ssl_dir.exists() {
+        info!("SSL 디렉토리가 없어 생성합니다: {}", config.ssl_dir);
+        std::fs::create_dir_all(ssl_dir)?;
+    }
+    
+    // trusted_certs 디렉토리 확인
+    let trusted_certs_dir = ssl_dir.join("trusted_certs");
+    if !trusted_certs_dir.exists() {
+        info!("신뢰할 인증서 디렉토리가 없어 생성합니다: {}", trusted_certs_dir.display());
+        std::fs::create_dir_all(&trusted_certs_dir)?;
+        
+        // 사용자에게 안내 메시지 출력
+        info!("========== 인증서 검증 오류 해결 방법 ==========");
+        info!("사설 HTTPS 사이트에 접속 시 인증서 오류가 발생하는 경우:");
+        info!("1. 브라우저에서 해당 사이트의 인증서를 내보내기 (PEM 또는 CRT 형식)");
+        info!("2. 내보낸 인증서를 {} 디렉토리에 복사", trusted_certs_dir.display());
+        info!("3. 서버를 재시작하여 인증서를 로드");
+        info!("============================================");
     }
     
     Ok(())
