@@ -178,61 +178,19 @@ impl PartitionManager {
         // 테이블별 인덱스 생성
         match table_type {
             TableType::RequestLogs => {
-                // timestamp 인덱스 생성
-                let timestamp_idx_sql = format!(
-                    "CREATE INDEX IF NOT EXISTS {}_timestamp_idx ON {} (timestamp)",
-                    partition_name, partition_name
-                );
-                client.execute(&timestamp_idx_sql, &[]).await?;
-                
-                // host 인덱스 생성
-                let host_idx_sql = format!(
-                    "CREATE INDEX IF NOT EXISTS {}_host_idx ON {} (host)",
-                    partition_name, partition_name
-                );
-                client.execute(&host_idx_sql, &[]).await?;
-                
-                // 기타 request_logs 전용 인덱스 생성
+                // request_logs 테이블 전용 인덱스만 생성
                 for index_sql in request_logs::create_partition_indices(&partition_name) {
                     client.execute(&index_sql, &[]).await?;
                 }
             },
             TableType::ProxyStats => {
-                // timestamp 인덱스 생성
-                let timestamp_idx_sql = format!(
-                    "CREATE INDEX IF NOT EXISTS {}_timestamp_idx ON {} (timestamp)",
-                    partition_name, partition_name
-                );
-                client.execute(&timestamp_idx_sql, &[]).await?;
-                
-                // host 인덱스 생성
-                let host_idx_sql = format!(
-                    "CREATE INDEX IF NOT EXISTS {}_host_idx ON {} (host)",
-                    partition_name, partition_name
-                );
-                client.execute(&host_idx_sql, &[]).await?;
-                
-                // 기타 proxy_stats 전용 인덱스 생성
+                // proxy_stats 테이블 전용 인덱스만 생성
                 for index_sql in proxy_stats::create_partition_indices(&partition_name) {
                     client.execute(&index_sql, &[]).await?;
                 }
             },
             TableType::ProxyStatsHourly => {
-                // timestamp 인덱스 생성
-                let timestamp_idx_sql = format!(
-                    "CREATE INDEX IF NOT EXISTS {}_timestamp_idx ON {} (timestamp)",
-                    partition_name, partition_name
-                );
-                client.execute(&timestamp_idx_sql, &[]).await?;
-                
-                // host 인덱스 생성
-                let host_idx_sql = format!(
-                    "CREATE INDEX IF NOT EXISTS {}_host_idx ON {} (host)",
-                    partition_name, partition_name
-                );
-                client.execute(&host_idx_sql, &[]).await?;
-                
-                // 기타 proxy_stats_hourly 전용 인덱스 생성
+                // proxy_stats_hourly 테이블 전용 인덱스만 생성
                 for index_sql in proxy_stats_hourly::create_partition_indices(&partition_name) {
                     client.execute(&index_sql, &[]).await?;
                 }

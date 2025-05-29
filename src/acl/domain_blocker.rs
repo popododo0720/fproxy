@@ -5,7 +5,8 @@ use std::sync::RwLock;
 use lru::LruCache;
 use once_cell::sync::Lazy;
 use tokio::time::Duration;
-use std::collections::{HashSet, HashMap};
+use std::collections::HashSet;
+use regex::Regex;
 
 use crate::config::Config;
 use crate::constants::{domain_blocks, domain_pattern_blocks, ACL_CACHE_SIZE};
@@ -25,8 +26,8 @@ static DOMAIN_BLOCK_CACHE: Lazy<RwLock<LruCache<String, MatchResult>>> =
 // 차단된 도메인 목록 (DB에서 로드) - 정확한 도메인 URL
 static BLOCKED_DOMAINS: Lazy<RwLock<HashSet<String>>> = Lazy::new(|| RwLock::new(HashSet::new()));
 
-// 와일드카드 패턴 (*.example.com)을 위한 접미사 매핑
-static BLOCKED_SUFFIXES: Lazy<RwLock<HashMap<String, bool>>> = Lazy::new(|| RwLock::new(HashMap::new()));
+// 모든 패턴을 정규표현식으로 처리
+static REGEX_PATTERNS: Lazy<RwLock<Vec<Regex>>> = Lazy::new(|| RwLock::new(Vec::new()));
 
 /// 도메인 차단을 처리하는 구조체
 pub struct DomainBlocker {
@@ -102,30 +103,14 @@ impl DomainBlocker {
             false
         };
 
-        // 와일드카드 패턴 확인
-        let is_suffix_match = if let Ok(suffixes) = BLOCKED_SUFFIXES.read() {
-            // 접미사 매치 확인
-            let domain_parts: Vec<&str> = host_lower.split('.').collect();
-            let domain_len = domain_parts.len();
-            
-            // 도메인의 모든 가능한 접미사를 검사
-            // 예: test.example.com -> [.example.com, .com]
-            let mut matches = false;
-            for i in 1..domain_len {
-                let suffix = format!(".{}", domain_parts[i..].join("."));
-                if let Some(&blocked) = suffixes.get(&suffix) {
-                    if blocked {
-                        matches = true;
-                        break;
-                    }
-                }
-            }
-            matches
+        // 정규표현식 패턴 확인 (와일드카드 패턴도 포함)
+        let is_pattern_match = if let Ok(patterns) = REGEX_PATTERNS.read() {
+            patterns.iter().any(|regex| regex.is_match(&host_lower))
         } else {
             false
         };
         
-        let is_blocked = is_blocked_in_config || is_blocked_in_db || is_suffix_match;
+        let is_blocked = is_blocked_in_config || is_blocked_in_db || is_pattern_match;
         
         // 결과를 캐시에 저장
         let result = if is_blocked {
@@ -276,7 +261,7 @@ impl DomainBlocker {
         
         // 결과 처리를 위한 임시 컬렉션
         let mut exact_domains = HashSet::new();
-        let mut suffix_patterns = HashMap::new();
+        let mut regex_patterns = Vec::new();
         
         // 정확한 도메인 처리
         for row in exact_rows {
@@ -288,11 +273,22 @@ impl DomainBlocker {
         for row in pattern_rows {
             let pattern: String = row.get(0);
             
-            // 와일드카드 패턴인지 확인
-            if pattern.starts_with("*.") {
-                // *.example.com -> .example.com 형태로 저장
-                let suffix = format!(".{}", &pattern[2..]);
-                suffix_patterns.insert(suffix.to_lowercase(), true);
+            // 정규표현식 패턴인 경우 (regex: 접두사 제거)
+            let regex_pattern = if pattern.starts_with("regex:") {
+                pattern[6..].to_string() // "regex:" 접두사 제거
+            } else {
+                // 그 외 모든 패턴은 그대로 정규표현식으로 사용
+                pattern
+            };
+            
+            match Regex::new(&regex_pattern) {
+                Ok(regex) => {
+                    regex_patterns.push(regex);
+                    debug!("패턴 컴파일 성공: {}", regex_pattern);
+                },
+                Err(e) => {
+                    error!("패턴 컴파일 실패: {} - {}", regex_pattern, e);
+                }
             }
         }
         
@@ -304,12 +300,12 @@ impl DomainBlocker {
             return Err("차단 도메인 목록 잠금 획득 실패".into());
         }
         
-        // 접미사 패턴 저장
-        if let Ok(mut blocked_suffixes) = BLOCKED_SUFFIXES.write() {
-            *blocked_suffixes = suffix_patterns.clone();
+        // 정규표현식 패턴 저장
+        if let Ok(mut patterns) = REGEX_PATTERNS.write() {
+            *patterns = regex_patterns.clone();
         } else {
-            error!("차단 접미사 목록 잠금 획득 실패");
-            return Err("차단 접미사 목록 잠금 획득 실패".into());
+            error!("정규표현식 패턴 목록 잠금 획득 실패");
+            return Err("정규표현식 패턴 목록 잠금 획득 실패".into());
         }
         
         // 캐시 초기화
@@ -318,9 +314,9 @@ impl DomainBlocker {
             debug!("도메인 차단 캐시 초기화 완료");
         }
         
-        let total_count = exact_domains.len() + suffix_patterns.len();
-        debug!("DB에서 {} 개의 차단 도메인 로드 완료 (정확한 도메인: {}, 와일드카드 패턴: {})", 
-             total_count, exact_domains.len(), suffix_patterns.len());
+        let total_count = exact_domains.len() + regex_patterns.len();
+        debug!("DB에서 {} 개의 차단 도메인 로드 완료 (정확한 도메인: {}, 패턴: {})", 
+             total_count, exact_domains.len(), regex_patterns.len());
         
         Ok(())
     }

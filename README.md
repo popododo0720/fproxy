@@ -81,7 +81,7 @@ HTTPS 사이트 접속 시 인증서 오류가 발생하는 경우:
      - "ads.example.net"
    
    blocked_patterns:
-     - "*.ads.*"
+     - ".*ads.*"
      - "tracker.*"
    ```
 
