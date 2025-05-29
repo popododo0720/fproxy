@@ -34,32 +34,3 @@ pub const SELECT_ACTIVE_DOMAINS: &str = "
     WHERE active = TRUE
     ORDER BY domain
 ";
-
-/// 도메인 추가 쿼리
-pub const INSERT_DOMAIN: &str = "
-    INSERT INTO domain_blocks (domain, created_by, description)
-    VALUES ($1, $2, $3)
-    RETURNING id
-";
-
-/// 도메인 비활성화 쿼리
-pub const DEACTIVATE_DOMAIN: &str = "
-    UPDATE domain_blocks
-    SET active = FALSE
-    WHERE domain = $1
-";
-
-/// 도메인 활성화 쿼리
-pub const ACTIVATE_DOMAIN: &str = "
-    UPDATE domain_blocks
-    SET active = TRUE
-    WHERE domain = $1
-";
-
-/// 도메인 존재 여부 확인 쿼리
-pub const CHECK_DOMAIN_EXISTS: &str = "
-    SELECT EXISTS (
-        SELECT FROM domain_blocks
-        WHERE domain = $1
-    )
-"; 

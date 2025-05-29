@@ -34,32 +34,3 @@ pub const SELECT_ACTIVE_PATTERNS: &str = "
     WHERE active = TRUE
     ORDER BY pattern
 ";
-
-/// 패턴 추가 쿼리
-pub const INSERT_PATTERN: &str = "
-    INSERT INTO domain_pattern_blocks (pattern, created_by, description)
-    VALUES ($1, $2, $3)
-    RETURNING id
-";
-
-/// 패턴 비활성화 쿼리
-pub const DEACTIVATE_PATTERN: &str = "
-    UPDATE domain_pattern_blocks
-    SET active = FALSE
-    WHERE pattern = $1
-";
-
-/// 패턴 활성화 쿼리
-pub const ACTIVATE_PATTERN: &str = "
-    UPDATE domain_pattern_blocks
-    SET active = TRUE
-    WHERE pattern = $1
-";
-
-/// 패턴 존재 여부 확인 쿼리
-pub const CHECK_PATTERN_EXISTS: &str = "
-    SELECT EXISTS (
-        SELECT FROM domain_pattern_blocks
-        WHERE pattern = $1
-    )
-"; 

@@ -503,10 +503,10 @@ impl Metrics {
         
         // 쿼리 실행 시도
         match executor.query_one(metrics_queries::SELECT_LAST_METRICS, &[], |row| {
-            let http_conns: i64 = row.get(0);
+            let _http_conns: i64 = row.get(0);
             let http_bytes_in: f64 = row.get(1);
             let http_bytes_out: f64 = row.get(2);
-            let tls_conns: i64 = row.get(3);
+            let _tls_conns: i64 = row.get(3);
             let tls_bytes_in: f64 = row.get(4);
             let tls_bytes_out: f64 = row.get(5);
             
@@ -518,20 +518,20 @@ impl Metrics {
             
             // 결과를 AtomicU64에 저장
             Ok((
-                http_conns as u64,
+                0, // 활성 연결은 항상 0으로 초기화
                 http_bytes_in_bytes,
                 http_bytes_out_bytes,
-                tls_conns as u64,
+                0, // 활성 연결은 항상 0으로 초기화
                 tls_bytes_in_bytes,
                 tls_bytes_out_bytes
             ))
         }).await {
-            Ok((http_conns, http_in, http_out, tls_conns, tls_in, tls_out)) => {
-                // 메트릭스 값 설정
-                self.http_active_connections.store(http_conns, Ordering::Relaxed);
+            Ok((_http_conns, http_in, http_out, _tls_conns, tls_in, tls_out)) => {
+                // 메트릭스 값 설정 - 활성 연결은 0으로 초기화
+                self.http_active_connections.store(0, Ordering::Relaxed);
                 self.http_bytes_transferred_in.store(http_in, Ordering::Relaxed);
                 self.http_bytes_transferred_out.store(http_out, Ordering::Relaxed);
-                self.tls_active_connections.store(tls_conns, Ordering::Relaxed);
+                self.tls_active_connections.store(0, Ordering::Relaxed);
                 self.tls_bytes_transferred_in.store(tls_in, Ordering::Relaxed);
                 self.tls_bytes_transferred_out.store(tls_out, Ordering::Relaxed);
                 
@@ -542,11 +542,17 @@ impl Metrics {
                     Self::bytes_to_mb(tls_out)
                 );
                 
+                info!("활성 연결 카운터가 0으로 초기화되었습니다.");
+                
                 Ok(())
             },
             Err(e) => {
                 if e.to_string().contains("no rows") {
                     warn!("DB에 저장된 메트릭스 정보가 없습니다. 초기값을 사용합니다.");
+                    // 활성 연결 카운터를 0으로 초기화
+                    self.http_active_connections.store(0, Ordering::Relaxed);
+                    self.tls_active_connections.store(0, Ordering::Relaxed);
+                    info!("활성 연결 카운터가 0으로 초기화되었습니다.");
                     Ok(())
                 } else {
                     error!("DB에서 메트릭스 로드 실패: {}", e);
