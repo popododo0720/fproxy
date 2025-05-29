@@ -8,7 +8,7 @@ use super::pool::{get_db_pool, DatabasePool};
 
 /// 쿼리 실행기 구조체
 pub struct QueryExecutor {
-    pool: Arc<DatabasePool>,
+    pub pool: Arc<DatabasePool>,
 }
 
 impl QueryExecutor {

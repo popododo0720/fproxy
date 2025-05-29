@@ -112,16 +112,42 @@ impl Session {
             return self.handle_blocked_domain(client_stream, host, is_connect, &request_str, buffer).await;
         }
 
-        // 요청 처리
+        // 연결 카운터 증가
         self.metrics.connection_opened(is_connect);
 
-        if is_connect {
+        // 결과와 상관없이 연결 카운터가 적절하게 관리되도록 처리
+        let result = if is_connect {
             // HTTPS 요청 처리
-            self.handle_https_request(client_stream, host, port, buffer).await
+            match self.handle_https_request(client_stream, host, port, buffer).await {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    // 핸들러 내부에서 connection_closed가 호출되지 않았을 수 있으므로 다시 호출
+                    // 중복 호출은 로그만 남고 영향 없음
+                    error!("[Session:{}] HTTPS 요청 처리 실패: {}", self.session_id(), e);
+                    Err(e)
+                }
+            }
         } else {
             // HTTP 요청 처리
-            self.handle_http_request(client_stream, host, port, &request_str, n, buffer).await
+            match self.handle_http_request(client_stream, host, port, &request_str, n, buffer).await {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    // 핸들러 내부에서 connection_closed가 호출되지 않았을 수 있으므로 다시 호출
+                    // 중복 호출은 로그만 남고 영향 없음
+                    error!("[Session:{}] HTTP 요청 처리 실패: {}", self.session_id(), e);
+                    Err(e)
+                }
+            }
+        };
+
+        // 에러 발생 시 연결 카운터를 감소시키지 못한 경우 처리
+        if let Err(e) = &result {
+            error!("[Session:{}] Error during session handling: {}", self.session_id(), e);
+            // 핸들러에서 이미 처리했을 수 있지만, 다시 한번 확인
+            self.metrics.connection_closed(is_connect);
         }
+
+        result
     }
     
     /// 버퍼 할당
@@ -361,10 +387,28 @@ impl Session {
         }
         
         // 1. 가짜 인증서로 클라이언트와 TLS 연결
-        let fake_cert = generate_fake_cert(host).await?;
+        let fake_cert = match generate_fake_cert(host).await {
+            Ok(cert) => cert,
+            Err(e) => {
+                error!("[Session:{}] Failed to generate fake certificate: {}", self.session_id(), e);
+                // 에러 발생 시 연결 카운터 감소
+                self.metrics.connection_closed(true);
+                return Err(e);
+            }
+        };
+        
         info!("[Session:{}] Generated fake certificate for {}", self.session_id(), host);
         
-        let tls_stream = accept_tls_with_cert(client_stream, fake_cert).await?;
+        let tls_stream = match accept_tls_with_cert(client_stream, fake_cert).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                error!("[Session:{}] Failed to establish TLS with client: {}", self.session_id(), e);
+                // 에러 발생 시 연결 카운터 감소
+                self.metrics.connection_closed(true);
+                return Err(e);
+            }
+        };
+        
         info!("[Session:{}] Established TLS with client for {}", self.session_id(), host);
         
         // 호스트와 포트 조합
@@ -377,18 +421,28 @@ impl Session {
                 
                 // 3. 중간에서 데이터 가로채기 - 요청 시작 시간 전달
                 let request_start_time = Instant::now();
-                proxy_tls_streams(tls_stream, real_tls_stream, Arc::clone(&self.metrics), &self.session_id(), host, request_start_time).await?;
-                
-                // 연결 종료 시 활성 연결 카운트 감소
-                self.metrics.connection_closed(true);
-                info!("[Session:{}] Completed TLS proxy for {}", self.session_id(), host);
-                Ok(())
+                match proxy_tls_streams(tls_stream, real_tls_stream, Arc::clone(&self.metrics), &self.session_id(), host, request_start_time).await {
+                    Ok(_) => {
+                        // 연결 종료 시 활성 연결 카운트 감소
+                        self.metrics.connection_closed(true);
+                        info!("[Session:{}] Completed TLS proxy for {}", self.session_id(), host);
+                        Ok(())
+                    },
+                    Err(e) => {
+                        // 프록시 스트림에서 에러 발생 시에도 연결 카운터 감소
+                        self.metrics.connection_closed(true);
+                        error!("[Session:{}] Error in TLS proxy: {}", self.session_id(), e);
+                        Err(e)
+                    }
+                }
             },
             Err(e) => {
                 // UnknownIssuer 오류 발생 시 설정 안내
                 if e.to_string().contains("UnknownIssuer") {
                     error!("[Session:{}] 서버 인증서 검증 실패: {}", self.session_id(), e);
                 }
+                // 에러 발생 시 연결 카운터 감소
+                self.metrics.connection_closed(true);
                 Err(e)
             }
         }
@@ -420,6 +474,8 @@ impl Session {
                 if let Some(pool) = &self.buffer_pool {
                     pool.return_buffer(buffer);
                 }
+                // 서버 연결 실패 시 연결 카운터 감소
+                self.metrics.connection_closed(false);
                 return Err(e.into());
             }
         };
@@ -431,6 +487,8 @@ impl Session {
             if let Some(pool) = &self.buffer_pool {
                 pool.return_buffer(buffer);
             }
+            // 요청 전달 실패 시 연결 카운터 감소
+            self.metrics.connection_closed(false);
             return Err(e.into());
         }
         
@@ -442,13 +500,20 @@ impl Session {
         // 프록시 시작 - 요청 시작 시간 전달
         info!("[Session:{}] Starting HTTP proxy for {}", self.session_id(), host);
         let request_start_time = Instant::now();
-        proxy_http_streams(client_stream, server_stream, Arc::clone(&self.metrics), &self.session_id(), request_start_time).await?;
-        
-        // 연결 종료 시 활성 연결 카운트 감소
-        self.metrics.connection_closed(false);
-        info!("[Session:{}] Completed HTTP proxy for {}", self.session_id(), host);
-        
-        Ok(())
+        match proxy_http_streams(client_stream, server_stream, Arc::clone(&self.metrics), &self.session_id(), request_start_time).await {
+            Ok(_) => {
+                // 연결 종료 시 활성 연결 카운트 감소
+                self.metrics.connection_closed(false);
+                info!("[Session:{}] Completed HTTP proxy for {}", self.session_id(), host);
+                Ok(())
+            },
+            Err(e) => {
+                // 프록시 에러 시 연결 카운터 감소
+                self.metrics.connection_closed(false);
+                error!("[Session:{}] Error during HTTP proxy: {}", self.session_id(), e);
+                Err(e)
+            }
+        }
     }
     
     /// HTTP 요청 로깅

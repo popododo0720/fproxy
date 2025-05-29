@@ -18,6 +18,17 @@ static METRICS_INSTANCE: Lazy<Arc<Metrics>> = Lazy::new(|| {
     // 주기적인 통계 로깅 설정 (비활성화)
     // 주기적인 통계 로깅 코드 제거
     
+    // DB에서 마지막 메트릭스 값 로드 시도
+    let metrics_clone = Arc::clone(&metrics);
+    tokio::spawn(async move {
+        // DB에서 마지막 메트릭스 값 로드
+        if let Err(e) = metrics_clone.load_last_metrics_from_db().await {
+            error!("DB에서 마지막 메트릭스 로드 실패: {}", e);
+        } else {
+            info!("DB에서 마지막 메트릭스 로드 완료");
+        }
+    });
+    
     // 시간별 통계 테이블 초기화
     let _metrics_clone = Arc::clone(&metrics);
     tokio::spawn(async move {
@@ -570,6 +581,86 @@ impl Metrics {
             self.http_active_connections.fetch_add(1, Ordering::Relaxed);
             debug!("HTTP 연결 시작, 현재 활성 HTTP 연결: {}", 
                   self.http_active_connections.load(Ordering::Relaxed));
+        }
+    }
+
+    // DB에서 마지막 메트릭스 값 로드
+    async fn load_last_metrics_from_db(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // 쿼리 실행기 가져오기
+        let executor = match db::query::QueryExecutor::get_instance().await {
+            Ok(executor) => executor,
+            Err(e) => {
+                error!("쿼리 실행기 가져오기 실패: {}", e);
+                return Err(e);
+            }
+        };
+        
+        // proxy_stats 테이블에서 마지막 레코드 가져오기
+        let query = "
+            SELECT 
+                http_active_connections,
+                http_bytes_in,
+                http_bytes_out,
+                tls_active_connections,
+                tls_bytes_in,
+                tls_bytes_out
+            FROM proxy_stats
+            ORDER BY timestamp DESC
+            LIMIT 1
+        ";
+        
+        // 쿼리 실행 시도
+        match executor.query_one(query, &[], |row| {
+            let http_conns: i64 = row.get(0);
+            let http_bytes_in: f64 = row.get(1);
+            let http_bytes_out: f64 = row.get(2);
+            let tls_conns: i64 = row.get(3);
+            let tls_bytes_in: f64 = row.get(4);
+            let tls_bytes_out: f64 = row.get(5);
+            
+            // MB에서 바이트로 변환 (데이터베이스에는 MB 단위로 저장됨)
+            let http_bytes_in_bytes = (http_bytes_in * 1024.0 * 1024.0) as u64;
+            let http_bytes_out_bytes = (http_bytes_out * 1024.0 * 1024.0) as u64;
+            let tls_bytes_in_bytes = (tls_bytes_in * 1024.0 * 1024.0) as u64;
+            let tls_bytes_out_bytes = (tls_bytes_out * 1024.0 * 1024.0) as u64;
+            
+            // 결과를 AtomicU64에 저장
+            Ok((
+                http_conns as u64,
+                http_bytes_in_bytes,
+                http_bytes_out_bytes,
+                tls_conns as u64,
+                tls_bytes_in_bytes,
+                tls_bytes_out_bytes
+            ))
+        }).await {
+            Ok((http_conns, http_in, http_out, tls_conns, tls_in, tls_out)) => {
+                // 메트릭스 값 설정
+                self.http_active_connections.store(http_conns, Ordering::Relaxed);
+                self.http_bytes_transferred_in.store(http_in, Ordering::Relaxed);
+                self.http_bytes_transferred_out.store(http_out, Ordering::Relaxed);
+                self.tls_active_connections.store(tls_conns, Ordering::Relaxed);
+                self.tls_bytes_transferred_in.store(tls_in, Ordering::Relaxed);
+                self.tls_bytes_transferred_out.store(tls_out, Ordering::Relaxed);
+                
+                info!("DB에서 로드된 메트릭스: HTTP in: {:.2} MB, out: {:.2} MB, TLS in: {:.2} MB, out: {:.2} MB",
+                    Self::bytes_to_mb(http_in),
+                    Self::bytes_to_mb(http_out),
+                    Self::bytes_to_mb(tls_in),
+                    Self::bytes_to_mb(tls_out)
+                );
+                
+                Ok(())
+            },
+            Err(e) => {
+                if e.to_string().contains("no rows") {
+                    warn!("DB에 저장된 메트릭스 정보가 없습니다. 초기값을 사용합니다.");
+                    Ok(())
+                } else {
+                    error!("DB에서 메트릭스 로드 실패: {}", e);
+                    Err(e)
+                }
+            }
         }
     }
 }
