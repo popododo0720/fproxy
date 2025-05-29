@@ -15,22 +15,30 @@ pub const CREATE_TABLE: &str = "
         timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
     ) PARTITION BY RANGE (timestamp)";
 
-/// 기본 인덱스 생성 쿼리
+/// 기본 인덱스 생성 쿼리 - 부모 테이블에만 적용
 pub const CREATE_INDICES: [&str; 3] = [
     "CREATE INDEX IF NOT EXISTS proxy_stats_hourly_host_idx ON proxy_stats_hourly(host)",
     "CREATE INDEX IF NOT EXISTS proxy_stats_hourly_timestamp_idx ON proxy_stats_hourly(timestamp)",
     "CREATE INDEX IF NOT EXISTS proxy_stats_hourly_hour_idx ON proxy_stats_hourly(hour)"
 ];
 
-/// 파티션별 추가 인덱스 생성 쿼리
+/// 파티션별 인덱스 생성 쿼리 - 각 파티션에 개별 적용
 pub fn create_partition_indices(partition_name: &str) -> Vec<String> {
     vec![
-        // 기본 인덱스
+        // 기본 인덱스 - 파티션별로 필요한 인덱스
+        format!(
+            "CREATE INDEX IF NOT EXISTS {}_timestamp_idx ON {} (timestamp)",
+            partition_name, partition_name
+        ),
+        format!(
+            "CREATE INDEX IF NOT EXISTS {}_host_idx ON {} (host)",
+            partition_name, partition_name
+        ),
         format!(
             "CREATE INDEX IF NOT EXISTS {}_hour_idx ON {} (hour)",
             partition_name, partition_name
         ),
-        // 특수 인덱스
+        // 추가 인덱스
         format!(
             "CREATE INDEX IF NOT EXISTS {}_request_count_idx ON {} (request_count)",
             partition_name, partition_name

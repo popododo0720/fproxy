@@ -162,6 +162,7 @@ pub async fn proxy_http_streams(
         
         async move {
             let mut total_bytes = 0u64;
+            // 초기에는 중형 버퍼로 시작
             let mut resp_buffer = BytesMut::with_capacity(BUFFER_SIZE_MEDIUM);
             let mut is_reading_response = false;
             let mut current_response_for = 0_u64;
@@ -200,9 +201,44 @@ pub async fn proxy_http_streams(
                                     
                                     debug!("[Session:{}] HTTP 응답 감지, 요청 #{} 처리 중", 
                                           session_id, current_response_for);
+                                          
+                                    // 응답 헤더에서 Content-Length 확인
+                                    for header in headers.iter() {
+                                        if header.name.is_empty() {
+                                            break;
+                                        }
+                                        
+                                        if header.name.eq_ignore_ascii_case("content-length") {
+                                            if let Ok(len_str) = std::str::from_utf8(header.value) {
+                                                if let Ok(len) = len_str.trim().parse::<usize>() {
+                                                    // 대용량 응답인 경우 버퍼 크기 조정
+                                                    if len > BUFFER_SIZE_MEDIUM {
+                                                        // 기존 버퍼 내용 보존하며 대형 버퍼로 교체
+                                                        let old_content = resp_buffer.clone().freeze();
+                                                        resp_buffer = BytesMut::with_capacity(BUFFER_SIZE_LARGE);
+                                                        resp_buffer.put_slice(&old_content);
+                                                        debug!("[Session:{}] 대용량 응답 감지 ({}KB), 대형 버퍼로 전환", 
+                                                              session_id, len / 1024);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         } else {
+                            // 버퍼 용량 확인 및 필요시 확장
+                            if resp_buffer.len() + bytes.len() > resp_buffer.capacity() {
+                                if resp_buffer.capacity() == BUFFER_SIZE_MEDIUM {
+                                    // 중형 버퍼가 가득 차면 대형 버퍼로 교체
+                                    let old_content = resp_buffer.clone().freeze();
+                                    resp_buffer = BytesMut::with_capacity(BUFFER_SIZE_LARGE);
+                                    resp_buffer.put_slice(&old_content);
+                                    debug!("[Session:{}] 응답 크기 초과, 대형 버퍼로 전환 ({}KB)", 
+                                          session_id, resp_buffer.len() / 1024);
+                                }
+                            }
+                            
                             resp_buffer.put_slice(&bytes);
                             
                             // 응답 종료 확인 - 메모리 효율적인 방식으로 구현

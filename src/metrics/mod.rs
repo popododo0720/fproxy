@@ -10,6 +10,7 @@ use chrono::Datelike;
 use chrono::Timelike;
 
 use crate::db;
+use crate::constants::metrics_queries;
 
 // 전역 메트릭스 인스턴스를 위한 Lazy 정적 변수
 static METRICS_INSTANCE: Lazy<Arc<Metrics>> = Lazy::new(|| {
@@ -167,34 +168,20 @@ impl Metrics {
         let tls_bytes_in_mb = Self::bytes_to_mb(metrics.tls_bytes_transferred_in);
         let tls_bytes_out_mb = Self::bytes_to_mb(metrics.tls_bytes_transferred_out);
         
-        // 시간별 통계 삽입 쿼리
-        let insert_query = "
-            INSERT INTO proxy_stats_hourly (
-                hour_start,
-                http_bytes_in,
-                http_bytes_out,
-                tls_bytes_in,
-                tls_bytes_out,
-                max_http_connections,
-                max_tls_connections
-            ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7
-            )
-        ";
-        
         // 쿼리 파라미터
         let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
             &hour_start,
+            &(metrics.http_active_connections as f64), // 평균 연결 수로 사용
             &http_bytes_in_mb,
             &http_bytes_out_mb,
+            &(metrics.tls_active_connections as f64), // 평균 연결 수로 사용
             &tls_bytes_in_mb,
             &tls_bytes_out_mb,
-            &(metrics.http_active_connections as i64),
-            &(metrics.tls_active_connections as i64)
+            &(metrics.start_time as i64)
         ];
         
         // 쿼리 실행
-        match executor.execute_query(insert_query, params).await {
+        match executor.execute_query(metrics_queries::INSERT_PROXY_STATS_HOURLY, params).await {
             Ok(_) => {
                 info!("시간별 통계 저장 완료: {}", hour_start);
                 Ok(())
@@ -209,15 +196,7 @@ impl Metrics {
     // 시간별 통계 테이블 생성 확인
     async fn ensure_hourly_stats_table(executor: &db::query::QueryExecutor) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 테이블 존재 여부 확인
-        let check_table_query = "
-            SELECT EXISTS (
-                SELECT FROM information_schema.tables 
-                WHERE table_schema = 'public' 
-                AND table_name = 'proxy_stats_hourly'
-            );
-        ";
-        
-        let table_exists = match executor.query_one(check_table_query, &[], |row| Ok(row.get::<_, bool>(0))).await {
+        let table_exists = match executor.query_one(metrics_queries::CHECK_PROXY_STATS_HOURLY_TABLE_EXISTS, &[], |row| Ok(row.get::<_, bool>(0))).await {
             Ok(exists) => exists,
             Err(e) => {
                 error!("테이블 존재 여부 확인 실패: {}", e);
@@ -226,34 +205,14 @@ impl Metrics {
         };
         
         if !table_exists {
-            // 테이블 생성 쿼리
-            let create_table_query = "
-                CREATE TABLE IF NOT EXISTS proxy_stats_hourly (
-                    id SERIAL PRIMARY KEY,
-                    hour_start TIMESTAMPTZ NOT NULL,
-                    http_bytes_in DOUBLE PRECISION NOT NULL,
-                    http_bytes_out DOUBLE PRECISION NOT NULL,
-                    tls_bytes_in DOUBLE PRECISION NOT NULL,
-                    tls_bytes_out DOUBLE PRECISION NOT NULL,
-                    max_http_connections BIGINT NOT NULL,
-                    max_tls_connections BIGINT NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                )
-            ";
-            
-            // 인덱스 생성 쿼리
-            let create_index_query = "
-                CREATE INDEX IF NOT EXISTS proxy_stats_hourly_hour_start_idx ON proxy_stats_hourly(hour_start)
-            ";
-            
             // 테이블 생성
-            if let Err(e) = executor.execute_query(create_table_query, &[]).await {
+            if let Err(e) = executor.execute_query(metrics_queries::CREATE_PROXY_STATS_HOURLY_TABLE, &[]).await {
                 error!("proxy_stats_hourly 테이블 생성 실패: {}", e);
                 return Err(e);
             }
             
             // 인덱스 생성
-            if let Err(e) = executor.execute_query(create_index_query, &[]).await {
+            if let Err(e) = executor.execute_query(metrics_queries::CREATE_PROXY_STATS_HOURLY_INDEX, &[]).await {
                 warn!("proxy_stats_hourly 인덱스 생성 실패: {}", e);
                 // 인덱스 생성 실패는 치명적이지 않으므로 계속 진행
             }
@@ -287,15 +246,7 @@ impl Metrics {
         };
         
         // 테이블 존재 여부 확인
-        let check_table_query = "
-            SELECT EXISTS (
-                SELECT FROM information_schema.tables 
-                WHERE table_schema = 'public' 
-                AND table_name = 'proxy_stats'
-            );
-        ";
-        
-        let table_exists = match executor.query_one(check_table_query, &[], |row| Ok(row.get::<_, bool>(0))).await {
+        let table_exists = match executor.query_one(metrics_queries::CHECK_PROXY_STATS_TABLE_EXISTS, &[], |row| Ok(row.get::<_, bool>(0))).await {
             Ok(exists) => exists,
             Err(e) => {
                 error!("테이블 존재 여부 확인 실패: {}", e);
@@ -307,36 +258,14 @@ impl Metrics {
             // 테이블이 존재하지 않으면 새로 생성
             debug!("proxy_stats 테이블이 존재하지 않습니다. 새로 생성합니다.");
             
-            // 테이블 생성 쿼리 - 파티셔닝 추가
-            let create_table_query = "
-                CREATE TABLE IF NOT EXISTS proxy_stats (
-                    id SERIAL,
-                    timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    http_active_connections BIGINT NOT NULL,
-                    http_bytes_in DOUBLE PRECISION NOT NULL,
-                    http_bytes_out DOUBLE PRECISION NOT NULL,
-                    tls_active_connections BIGINT NOT NULL,
-                    tls_bytes_in DOUBLE PRECISION NOT NULL,
-                    tls_bytes_out DOUBLE PRECISION NOT NULL,
-                    uptime_seconds BIGINT NOT NULL,
-                    seconds_since_reset BIGINT NOT NULL DEFAULT 0,
-                    PRIMARY KEY (id, timestamp)
-                ) PARTITION BY RANGE (timestamp)
-            ";
-            
-            // 인덱스 생성 쿼리
-            let create_index_query = "
-                CREATE INDEX IF NOT EXISTS proxy_stats_timestamp_idx ON proxy_stats(timestamp)
-            ";
-            
             // 테이블 생성 실행
-            if let Err(e) = executor.execute_query(create_table_query, &[]).await {
+            if let Err(e) = executor.execute_query(metrics_queries::CREATE_PROXY_STATS_TABLE, &[]).await {
                 error!("proxy_stats 테이블 생성 실패: {}", e);
                 return Err(e);
             }
             
             // 인덱스 생성 실행
-            if let Err(e) = executor.execute_query(create_index_query, &[]).await {
+            if let Err(e) = executor.execute_query(metrics_queries::CREATE_PROXY_STATS_INDEX, &[]).await {
                 error!("proxy_stats 인덱스 생성 실패: {}", e);
                 // 인덱스 생성 실패는 치명적이지 않으므로 계속 진행
                 warn!("proxy_stats 인덱스 생성 실패했지만 계속 진행합니다");
@@ -374,15 +303,7 @@ impl Metrics {
             start_date.year(), start_date.month(), start_date.day());
         
         // 파티션 존재 여부 확인
-        let check_partition_query = "
-            SELECT EXISTS (
-                SELECT FROM pg_tables 
-                WHERE schemaname = 'public' 
-                AND tablename = $1
-            )
-        ";
-        
-        let partition_exists = match executor.query_one(check_partition_query, &[&partition_name], |row| Ok(row.get::<_, bool>(0))).await {
+        let partition_exists = match executor.query_one(metrics_queries::CHECK_PARTITION_EXISTS, &[&partition_name], |row| Ok(row.get::<_, bool>(0))).await {
             Ok(exists) => exists,
             Err(e) => {
                 error!("파티션 존재 여부 확인 실패: {}", e);
@@ -393,10 +314,11 @@ impl Metrics {
         if !partition_exists {
             // 파티션 생성 쿼리
             let create_partition_query = format!(
-                "CREATE TABLE IF NOT EXISTS {} PARTITION OF proxy_stats 
-                 FOR VALUES FROM ('{}') TO ('{}')",
-                partition_name, start_date, end_date
-            );
+                "{}",
+                metrics_queries::CREATE_PARTITION_FORMAT
+            ).replace("{}", &partition_name)
+             .replace("{}", &start_date.to_string())
+             .replace("{}", &end_date.to_string());
             
             // 파티션 생성 실행
             if let Err(e) = executor.execute_query(&create_partition_query, &[]).await {
@@ -406,9 +328,10 @@ impl Metrics {
             
             // 파티션별 인덱스 생성
             let create_index_query = format!(
-                "CREATE INDEX IF NOT EXISTS {}_timestamp_idx ON {} (timestamp)",
-                partition_name, partition_name
-            );
+                "{}",
+                metrics_queries::CREATE_PARTITION_INDEX_FORMAT
+            ).replace("{}", &partition_name)
+             .replace("{}", &partition_name);
             
             if let Err(e) = executor.execute_query(&create_index_query, &[]).await {
                 warn!("파티션 인덱스 생성 실패: {}", e);
@@ -437,23 +360,6 @@ impl Metrics {
             }
         };
         
-        // 통계 데이터 삽입 쿼리
-        let insert_query = "
-            INSERT INTO proxy_stats (
-                timestamp, 
-                http_active_connections, 
-                http_bytes_in, 
-                http_bytes_out, 
-                tls_active_connections, 
-                tls_bytes_in, 
-                tls_bytes_out, 
-                uptime_seconds,
-                seconds_since_reset
-            ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9
-            )
-        ";
-        
         // 현재 시간
         let now = Utc::now();
         
@@ -480,7 +386,7 @@ impl Metrics {
         ];
         
         // 쿼리 실행
-        match executor.execute_query(insert_query, params).await {
+        match executor.execute_query(metrics_queries::INSERT_PROXY_STATS, params).await {
             Ok(_) => {
                 debug!("메트릭스 통계 DB 저장 완료");
                 Ok(())
@@ -501,7 +407,7 @@ impl Metrics {
                             info!("누락된 파티션 자동 생성: {}", partition_name);
                             
                             // 파티션 생성 후 다시 시도
-                            match executor.execute_query(insert_query, params).await {
+                            match executor.execute_query(metrics_queries::INSERT_PROXY_STATS, params).await {
                                 Ok(_) => {
                                     debug!("파티션 생성 후 메트릭스 통계 DB 저장 완료");
                                     return Ok(());
@@ -595,26 +501,12 @@ impl Metrics {
             }
         };
         
-        // proxy_stats 테이블에서 마지막 레코드 가져오기
-        let query = "
-            SELECT 
-                http_active_connections,
-                http_bytes_in,
-                http_bytes_out,
-                tls_active_connections,
-                tls_bytes_in,
-                tls_bytes_out
-            FROM proxy_stats
-            ORDER BY timestamp DESC
-            LIMIT 1
-        ";
-        
         // 쿼리 실행 시도
-        match executor.query_one(query, &[], |row| {
-            let http_conns: i64 = row.get(0);
+        match executor.query_one(metrics_queries::SELECT_LAST_METRICS, &[], |row| {
+            let _http_conns: i64 = row.get(0);
             let http_bytes_in: f64 = row.get(1);
             let http_bytes_out: f64 = row.get(2);
-            let tls_conns: i64 = row.get(3);
+            let _tls_conns: i64 = row.get(3);
             let tls_bytes_in: f64 = row.get(4);
             let tls_bytes_out: f64 = row.get(5);
             
@@ -626,20 +518,20 @@ impl Metrics {
             
             // 결과를 AtomicU64에 저장
             Ok((
-                http_conns as u64,
+                0, // 활성 연결은 항상 0으로 초기화
                 http_bytes_in_bytes,
                 http_bytes_out_bytes,
-                tls_conns as u64,
+                0, // 활성 연결은 항상 0으로 초기화
                 tls_bytes_in_bytes,
                 tls_bytes_out_bytes
             ))
         }).await {
-            Ok((http_conns, http_in, http_out, tls_conns, tls_in, tls_out)) => {
-                // 메트릭스 값 설정
-                self.http_active_connections.store(http_conns, Ordering::Relaxed);
+            Ok((_http_conns, http_in, http_out, _tls_conns, tls_in, tls_out)) => {
+                // 메트릭스 값 설정 - 활성 연결은 0으로 초기화
+                self.http_active_connections.store(0, Ordering::Relaxed);
                 self.http_bytes_transferred_in.store(http_in, Ordering::Relaxed);
                 self.http_bytes_transferred_out.store(http_out, Ordering::Relaxed);
-                self.tls_active_connections.store(tls_conns, Ordering::Relaxed);
+                self.tls_active_connections.store(0, Ordering::Relaxed);
                 self.tls_bytes_transferred_in.store(tls_in, Ordering::Relaxed);
                 self.tls_bytes_transferred_out.store(tls_out, Ordering::Relaxed);
                 
@@ -650,11 +542,17 @@ impl Metrics {
                     Self::bytes_to_mb(tls_out)
                 );
                 
+                info!("활성 연결 카운터가 0으로 초기화되었습니다.");
+                
                 Ok(())
             },
             Err(e) => {
                 if e.to_string().contains("no rows") {
                     warn!("DB에 저장된 메트릭스 정보가 없습니다. 초기값을 사용합니다.");
+                    // 활성 연결 카운터를 0으로 초기화
+                    self.http_active_connections.store(0, Ordering::Relaxed);
+                    self.tls_active_connections.store(0, Ordering::Relaxed);
+                    info!("활성 연결 카운터가 0으로 초기화되었습니다.");
                     Ok(())
                 } else {
                     error!("DB에서 메트릭스 로드 실패: {}", e);

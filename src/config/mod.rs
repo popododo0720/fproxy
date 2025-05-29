@@ -4,6 +4,15 @@ use std::io::Read;
 use std::collections::HashSet;
 
 use serde::{Serialize, Deserialize};
+use regex::Regex;
+use lazy_static::lazy_static;
+use std::sync::RwLock;
+use log::{debug, error};
+
+// 정규표현식 캐시
+lazy_static! {
+    static ref REGEX_CACHE: RwLock<std::collections::HashMap<String, Regex>> = RwLock::new(std::collections::HashMap::new());
+}
 
 /// 프록시 서버 설정
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -51,8 +60,8 @@ impl Config {
         Self {
             bind_host: "0.0.0.0".to_string(),
             bind_port: 50000,
-            buffer_size: 8192,
-            timeout_ms: 30000,
+            buffer_size: 32768,
+            timeout_ms: 60000,
             ssl_dir: "ssl".to_string(),
             worker_threads: None,
             tls_verify_certificate: true,
@@ -94,19 +103,53 @@ impl Config {
             config.blocked_patterns = Self::default_blocked_patterns();
         }
 
+        // 정규표현식 패턴 미리 컴파일
+        for pattern in &config.blocked_patterns {
+            if pattern.starts_with("regex:") {
+                let regex_pattern = &pattern[6..]; // "regex:" 접두사 제거
+                match Regex::new(regex_pattern) {
+                    Ok(regex) => {
+                        let mut cache = REGEX_CACHE.write().unwrap();
+                        cache.insert(pattern.clone(), regex);
+                        debug!("정규표현식 패턴 컴파일 성공: {}", regex_pattern);
+                    },
+                    Err(e) => {
+                        error!("정규표현식 패턴 컴파일 실패: {} - {}", regex_pattern, e);
+                    }
+                }
+            }
+        }
+
         Ok(config)
     }
     
     /// 도메인이 차단 목록에 있는지 확인
     pub fn is_domain_blocked(&self, domain: &str) -> bool {
-        self.blocked_domains.contains(domain) || 
-        self.blocked_patterns.iter().any(|pattern| {
+        // 1. 정확한 도메인 매칭
+        if self.blocked_domains.contains(domain) {
+            return true;
+        }
+        
+        // 2. 패턴 매칭
+        for pattern in &self.blocked_patterns {
+            // 2.1 와일드카드 패턴 (*.example.com)
             if pattern.starts_with("*.") {
                 let suffix = &pattern[1..]; 
-                domain.ends_with(suffix)
-            } else {
-                false
+                if domain.ends_with(suffix) {
+                    return true;
+                }
             }
-        })
+            // 2.2 정규표현식 패턴 (regex:.*\.example\.com)
+            else if pattern.starts_with("regex:") {
+                let cache = REGEX_CACHE.read().unwrap();
+                if let Some(regex) = cache.get(pattern) {
+                    if regex.is_match(domain) {
+                        return true;
+                    }
+                }
+            }
+        }
+        
+        false
     }
 }

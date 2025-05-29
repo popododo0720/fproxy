@@ -30,6 +30,8 @@ tokio-postgres = { version = "0.7.13", features = ["with-chrono-0_4"] }
 deadpool = "0.12.2"
 deadpool-postgres = "0.14.1"
 humantime = "2.2.0"
+regex = "1.9"
+lazy_static = "1.4"
 
 [profile.release]
 opt-level = 3      # 최적화 수준
