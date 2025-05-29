@@ -1,112 +1,109 @@
-# 로그 관리 시스템
+# UDSS Proxy
 
-PostgreSQL을 사용한 고성능 로그 관리 시스템입니다. 이 시스템은 객체지향적 설계와 함수형 스타일을 적용하여 로그 데이터를 효율적으로 관리합니다.
+UDSS Proxy는 HTTP/HTTPS 트래픽을 중개하고 모니터링하는 프록시 서버입니다. 도메인 기반 접근 제어, TLS 인증서 관리, 트래픽 모니터링 등의 기능을 제공합니다.
 
 ## 주요 기능
 
-- 요청 로그 및 차단 로그 관리
-- 자동 파티션 관리 (시간 기반 파티셔닝)
-- 설정 파일 기반 구성 (YAML)
-- 이벤트 트리거를 통한 자동 파티션 생성 및 삭제
-- 성능 최적화된 인덱싱
-- 유용한 통계 및 분석 뷰
+- HTTP/HTTPS 프록시 기능
+- 도메인 기반 접근 제어 (차단 목록)
+- 실시간 트래픽 모니터링
+- TLS 인증서 자동 생성 및 관리
+- 내부 IP 주소에 대한 인증서 검증 옵션
+- 버퍼 풀 최적화로 메모리 사용 효율화
+- 데이터베이스 기반 차단 도메인 관리
 
-## 설치 방법
+## 설치 및 실행
 
-1. PostgreSQL 데이터베이스 서버가 설치되어 있어야 합니다.
-2. `db.yml` 파일을 설정합니다.
-3. 초기화 스크립트를 실행합니다:
+### 요구 사항
+- Rust 1.70 이상
+- PostgreSQL 데이터베이스 (선택 사항)
 
+### 실행 방법
 ```bash
-psql -U postgres -d your_database -f init.sql
+cargo build --release
+./target/release/udss-proxy
 ```
 
-## 설정 파일 (db.yml)
+## 설정
 
+`config.yml` 파일을 통해 프록시 서버를 설정할 수 있습니다. 설정 파일이 없는 경우 기본 설정이 사용됩니다.
+
+### 기본 설정
 ```yaml
-# PostgreSQL 데이터베이스 접속 정보
-connection:
-  host: localhost
-  port: 5432
-  database: logs_db
-  user: postgres
-  password: your_password_here
-  sslmode: prefer
-
-# 로그 파티션 설정
-partitioning:
-  # 파티션 생성 주기 (일)
-  creation_interval: 30
-  # 파티션 보관 기간 (일)
-  retention_period: 90
-  # 미리 생성할 파티션 수
-  future_partitions: 2
+bind_host: "0.0.0.0"
+bind_port: 50000
+buffer_size: 8192
+timeout_ms: 30000   # 30초
+ssl_dir: "ssl"
+worker_threads: null  # null - 시스템 코어 수만큼 사용
+cache_enabled: true
+cache_size: 1000    # 최대 캐시 항목 수
+cache_ttl_seconds: 300  # 캐시 항목 유효 시간
+tls_verify_certificate: true  # TLS 인증서 검증 활성화/비활성화
+disable_verify_internal_ip: true  # 내부 IP에 대한 인증서 검증 비활성화 여부
+access_control: {}
+blocked_domains: []
+blocked_patterns: []
 ```
 
-## 주요 테이블
+### 환경 변수
+- `CONFIG_FILE`: 설정 파일 경로 지정
+- `FD_LIMIT`: 파일 디스크립터 제한 설정 (기본값: 100,000)
 
-- `logs.request_logs`: 요청 로그를 저장합니다.
-- `logs.reject_logs`: 차단된 요청 로그를 저장합니다.
-- `logs.partition_config`: 파티션 관리 설정을 저장합니다.
+## TLS 인증서 관리
 
-## 주요 함수
+UDSS Proxy는 HTTPS 연결을 중개하기 위해 자체 서명된 루트 CA 인증서를 생성합니다. 이 인증서는 `ssl/ca_cert.pem` 파일로 저장됩니다.
 
-- `logs.initialize_partitions()`: 초기 파티션을 생성합니다.
-- `logs.manage_partitions()`: 파티션을 관리합니다 (생성 및 삭제).
-- `logs.get_partition_status()`: 파티션 상태를 확인합니다.
-- `logs.run_partition_maintenance()`: 수동으로 파티션 관리를 실행합니다.
-- `logs.update_partition_config_from_yaml()`: YAML 파일에서 설정을 업데이트합니다.
+### 인증서 문제 해결
 
-## 자동 파티션 관리
+HTTPS 사이트 접속 시 인증서 오류가 발생하는 경우:
 
-이 시스템은 다음과 같은 방식으로 파티션을 자동으로 관리합니다:
+1. **클라이언트에 루트 CA 인증서 설치**
+   - `ssl/ca_cert.pem` 또는 `ssl/ca_cert.crt` 파일을 클라이언트의 신뢰할 수 있는 루트 인증 기관에 설치
 
-1. 데이터베이스 이벤트 트리거: 테이블 생성/변경/삭제 시 파티션 관리 함수가 실행됩니다.
-2. 로그 삽입 트리거: 로그 삽입 시 일정 확률(1%)로 파티션 관리 함수가 실행됩니다.
-3. 설정 기반 관리: `db.yml` 파일에서 파티션 생성 주기, 보관 기간 등을 설정할 수 있습니다.
+2. **특정 사이트의 인증서 검증 오류 해결**
+   - 해당 사이트의 인증서를 브라우저에서 내보내기 (PEM 또는 CRT 형식)
+   - 내보낸 인증서를 `ssl/trusted_certs/` 디렉토리에 복사
+   - 서버 재시작하여 인증서 로드
 
-## 사용 예시
+3. **인증서 검증 비활성화**
+   - `config.yml` 파일에서 `tls_verify_certificate: false`로 설정
+   - 이 방법은 보안상 권장되지 않으며, 테스트 환경에서만 사용하세요
 
-### 로그 삽입
+## 도메인 차단 설정
 
-```sql
--- 요청 로그 삽입
-INSERT INTO logs.request_logs 
-    (host, content, timestamp, session_id, request_path, request_method, response_code, response_time)
-VALUES 
-    ('example.com', '요청 내용', NOW(), 'session-123', '/api/data', 'GET', 200, 0.123);
+도메인 차단은 두 가지 방법으로 설정할 수 있습니다:
 
--- 차단 로그 삽입
-INSERT INTO logs.reject_logs 
-    (host, ip, content, timestamp, session_id, reason, block_rule)
-VALUES 
-    ('example.com', '192.168.1.1', '차단된 요청', NOW(), 'session-456', '악성 트래픽', 'RULE-001');
-```
+1. **설정 파일 사용**
+   ```yaml
+   blocked_domains:
+     - "example.com"
+     - "ads.example.net"
+   
+   blocked_patterns:
+     - "*.ads.*"
+     - "tracker.*"
+   ```
 
-### 파티션 상태 확인
+2. **데이터베이스 사용**
+   - `domain_blocks` 테이블과 `domain_pattern_blocks` 테이블에 차단할 도메인 정보 저장
+   - 서버가 시작될 때 자동으로 데이터베이스에서 차단 목록을 로드
 
-```sql
--- 파티션 상태 확인
-SELECT * FROM logs.get_partition_status();
+## 문제 해결
 
--- 파티션 통계 확인
-SELECT * FROM logs.collect_partition_stats();
-```
+### TLS 핸드셰이크 오류 (CertificateUnknown)
 
-### 수동 파티션 관리
+이 오류는 클라이언트가 프록시의 인증서를 신뢰하지 않을 때 발생합니다.
 
-```sql
--- 수동으로 파티션 관리 실행
-SELECT logs.run_partition_maintenance();
+**해결 방법:**
+1. 프록시 서버의 루트 CA 인증서(`ssl/ca_cert.pem`)를 클라이언트 시스템에 설치
+2. 설정 파일에서 `tls_verify_certificate: false`로 설정 (테스트 환경에서만 권장)
+3. 특정 사이트의 인증서를 `ssl/trusted_certs/` 디렉토리에 추가
 
--- 설정 업데이트 후 파티션 관리 실행
-SELECT logs.update_partition_config_from_yaml('db.yml');
-SELECT logs.run_partition_maintenance();
-```
+### 내부 IP 주소 인증서 검증 오류
 
-## 성능 최적화
+내부 IP 주소에 대한 인증서 검증 문제는 `disable_verify_internal_ip: true` 설정으로 해결할 수 있습니다.
 
-- 모든 파티션에는 자동으로 인덱스가 생성됩니다.
-- 파티션은 날짜 기반으로 관리되어 쿼리 성능을 향상시킵니다.
-- 오래된 데이터는 자동으로 삭제되어 데이터베이스 크기를 관리합니다.
-- 통계 뷰를 통해 로그 데이터를 효율적으로 분석할 수 있습니다. 
+## 라이선스
+
+이 프로젝트는 MIT 라이선스 하에 배포됩니다.

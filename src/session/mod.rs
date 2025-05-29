@@ -20,6 +20,7 @@ use crate::proxy::tls::proxy_tls_streams;
 use crate::acl::domain_blocker::DomainBlocker;
 use crate::acl::block_page::BlockPage;
 use crate::REQUEST_LOGGER;
+use crate::DOMAIN_BLOCKER;
 
 /// HTTP 요청 파싱 결과
 #[derive(Debug)]
@@ -49,7 +50,7 @@ impl Session {
             config: Arc::clone(&config),
             buffer_pool,
             start_time: Instant::now(),
-            domain_blocker: Arc::new(DomainBlocker::new(Arc::clone(&config))),
+            domain_blocker: DOMAIN_BLOCKER.clone(),
             block_page: BlockPage::new(),
         }
     }
@@ -502,7 +503,7 @@ impl Session {
         let request_start_time = Instant::now();
         match proxy_http_streams(client_stream, server_stream, Arc::clone(&self.metrics), &self.session_id(), request_start_time).await {
             Ok(_) => {
-                // 연결 종료 시 활성 연결 카운트 감소
+                // 연결 종료 시 활성 연결 카운터 감소
                 self.metrics.connection_closed(false);
                 info!("[Session:{}] Completed HTTP proxy for {}", self.session_id(), host);
                 Ok(())
