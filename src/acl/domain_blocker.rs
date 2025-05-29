@@ -8,7 +8,7 @@ use tokio::time::Duration;
 use std::collections::{HashSet, HashMap};
 
 use crate::config::Config;
-use crate::constants::ACL_CACHE_SIZE;
+use crate::constants::{domain_blocks, domain_pattern_blocks, ACL_CACHE_SIZE};
 use crate::db;
 
 /// 도메인 매칭 결과를 나타내는 열거형
@@ -170,15 +170,7 @@ impl DomainBlocker {
         };
         
         // 1. 정확한 도메인 테이블 존재 여부 확인
-        let check_domain_table_query = "
-            SELECT EXISTS (
-                SELECT FROM information_schema.tables 
-                WHERE table_schema = 'public' 
-                AND table_name = 'domain_blocks'
-            );
-        ";
-        
-        let domain_table_exists = match executor.query_one(check_domain_table_query, &[], |row| Ok(row.get::<_, bool>(0))).await {
+        let domain_table_exists = match executor.query_one(domain_blocks::CHECK_TABLE_EXISTS, &[], |row| Ok(row.get::<_, bool>(0))).await {
             Ok(exists) => exists,
             Err(e) => {
                 error!("domain_blocks 테이블 존재 여부 확인 실패: {}", e);
@@ -187,15 +179,7 @@ impl DomainBlocker {
         };
         
         // 2. 패턴 도메인 테이블 존재 여부 확인
-        let check_pattern_table_query = "
-            SELECT EXISTS (
-                SELECT FROM information_schema.tables 
-                WHERE table_schema = 'public' 
-                AND table_name = 'domain_pattern_blocks'
-            );
-        ";
-        
-        let pattern_table_exists = match executor.query_one(check_pattern_table_query, &[], |row| Ok(row.get::<_, bool>(0))).await {
+        let pattern_table_exists = match executor.query_one(domain_pattern_blocks::CHECK_TABLE_EXISTS, &[], |row| Ok(row.get::<_, bool>(0))).await {
             Ok(exists) => exists,
             Err(e) => {
                 error!("domain_pattern_blocks 테이블 존재 여부 확인 실패: {}", e);
@@ -207,34 +191,18 @@ impl DomainBlocker {
         if !domain_table_exists {
             debug!("domain_blocks 테이블이 존재하지 않습니다. 새로 생성합니다.");
             
-            // 테이블 생성 쿼리
-            let create_domain_table_query = "
-                CREATE TABLE IF NOT EXISTS domain_blocks (
-                    id SERIAL PRIMARY KEY,
-                    domain VARCHAR(255) NOT NULL,
-                    created_by VARCHAR(100) NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    description TEXT,
-                    active BOOLEAN NOT NULL DEFAULT TRUE
-                )
-            ";
-            
-            // 인덱스 생성 쿼리
-            let create_domain_index_query = "
-                CREATE INDEX IF NOT EXISTS domain_blocks_domain_idx ON domain_blocks(domain);
-                CREATE INDEX IF NOT EXISTS domain_blocks_active_idx ON domain_blocks(active);
-            ";
-            
             // 테이블 생성 실행
-            if let Err(e) = executor.execute_query(create_domain_table_query, &[]).await {
+            if let Err(e) = executor.execute_query(domain_blocks::CREATE_TABLE, &[]).await {
                 error!("domain_blocks 테이블 생성 실패: {}", e);
                 return Err(e);
             }
             
             // 인덱스 생성 실행
-            if let Err(e) = executor.execute_query(create_domain_index_query, &[]).await {
-                warn!("domain_blocks 인덱스 생성 실패: {}", e);
-                // 인덱스 생성 실패는 치명적이지 않으므로 계속 진행
+            for index_query in domain_blocks::CREATE_INDICES.iter() {
+                if let Err(e) = executor.execute_query(index_query, &[]).await {
+                    warn!("domain_blocks 인덱스 생성 실패: {}", e);
+                    // 인덱스 생성 실패는 치명적이지 않으므로 계속 진행
+                }
             }
             
             info!("domain_blocks 테이블이 성공적으로 생성되었습니다.");
@@ -246,34 +214,18 @@ impl DomainBlocker {
         if !pattern_table_exists {
             debug!("domain_pattern_blocks 테이블이 존재하지 않습니다. 새로 생성합니다.");
             
-            // 테이블 생성 쿼리
-            let create_pattern_table_query = "
-                CREATE TABLE IF NOT EXISTS domain_pattern_blocks (
-                    id SERIAL PRIMARY KEY,
-                    pattern VARCHAR(255) NOT NULL,
-                    created_by VARCHAR(100) NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    description TEXT,
-                    active BOOLEAN NOT NULL DEFAULT TRUE
-                )
-            ";
-            
-            // 인덱스 생성 쿼리
-            let create_pattern_index_query = "
-                CREATE INDEX IF NOT EXISTS domain_pattern_blocks_pattern_idx ON domain_pattern_blocks(pattern);
-                CREATE INDEX IF NOT EXISTS domain_pattern_blocks_active_idx ON domain_pattern_blocks(active);
-            ";
-            
             // 테이블 생성 실행
-            if let Err(e) = executor.execute_query(create_pattern_table_query, &[]).await {
+            if let Err(e) = executor.execute_query(domain_pattern_blocks::CREATE_TABLE, &[]).await {
                 error!("domain_pattern_blocks 테이블 생성 실패: {}", e);
                 return Err(e);
             }
             
             // 인덱스 생성 실행
-            if let Err(e) = executor.execute_query(create_pattern_index_query, &[]).await {
-                warn!("domain_pattern_blocks 인덱스 생성 실패: {}", e);
-                // 인덱스 생성 실패는 치명적이지 않으므로 계속 진행
+            for index_query in domain_pattern_blocks::CREATE_INDICES.iter() {
+                if let Err(e) = executor.execute_query(index_query, &[]).await {
+                    warn!("domain_pattern_blocks 인덱스 생성 실패: {}", e);
+                    // 인덱스 생성 실패는 치명적이지 않으므로 계속 진행
+                }
             }
             
             info!("domain_pattern_blocks 테이블이 성공적으로 생성되었습니다.");
@@ -295,22 +247,6 @@ impl DomainBlocker {
             }
         };
         
-        // 1. 정확한 도메인 목록 로드
-        let exact_domains_query = "
-            SELECT domain
-            FROM domain_blocks
-            WHERE active = TRUE
-            ORDER BY domain
-        ";
-        
-        // 2. 패턴 도메인 목록 로드
-        let pattern_domains_query = "
-            SELECT pattern
-            FROM domain_pattern_blocks
-            WHERE active = TRUE
-            ORDER BY pattern
-        ";
-        
         // 클라이언트 가져오기
         let client = match executor.pool.get_client().await {
             Ok(client) => client,
@@ -321,7 +257,7 @@ impl DomainBlocker {
         };
         
         // 정확한 도메인 쿼리 실행
-        let exact_rows = match client.query(exact_domains_query, &[]).await {
+        let exact_rows = match client.query(domain_blocks::SELECT_ACTIVE_DOMAINS, &[]).await {
             Ok(rows) => rows,
             Err(e) => {
                 error!("정확한 도메인 차단 목록 쿼리 실패: {}", e);
@@ -330,7 +266,7 @@ impl DomainBlocker {
         };
         
         // 패턴 도메인 쿼리 실행
-        let pattern_rows = match client.query(pattern_domains_query, &[]).await {
+        let pattern_rows = match client.query(domain_pattern_blocks::SELECT_ACTIVE_PATTERNS, &[]).await {
             Ok(rows) => rows,
             Err(e) => {
                 error!("패턴 도메인 차단 목록 쿼리 실패: {}", e);
