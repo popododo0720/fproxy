@@ -122,8 +122,7 @@ impl Session {
             match self.handle_https_request(client_stream, host, port, buffer).await {
                 Ok(()) => Ok(()),
                 Err(e) => {
-                    // 핸들러 내부에서 connection_closed가 호출되지 않았을 수 있으므로 다시 호출
-                    // 중복 호출은 로그만 남고 영향 없음
+                    // 핸들러 내부에서 이미 connection_closed가 호출되므로 여기서는 호출하지 않음
                     error!("[Session:{}] HTTPS 요청 처리 실패: {}", self.session_id(), e);
                     Err(e)
                 }
@@ -133,19 +132,17 @@ impl Session {
             match self.handle_http_request(client_stream, host, port, &request_str, n, buffer).await {
                 Ok(()) => Ok(()),
                 Err(e) => {
-                    // 핸들러 내부에서 connection_closed가 호출되지 않았을 수 있으므로 다시 호출
-                    // 중복 호출은 로그만 남고 영향 없음
+                    // 핸들러 내부에서 이미 connection_closed가 호출되므로 여기서는 호출하지 않음
                     error!("[Session:{}] HTTP 요청 처리 실패: {}", self.session_id(), e);
                     Err(e)
                 }
             }
         };
 
-        // 에러 발생 시 연결 카운터를 감소시키지 못한 경우 처리
+        // 에러 발생 시 로그만 남기고 connection_closed는 호출하지 않음 (이미 핸들러에서 호출됨)
         if let Err(e) = &result {
             error!("[Session:{}] Error during session handling: {}", self.session_id(), e);
-            // 핸들러에서 이미 처리했을 수 있지만, 다시 한번 확인
-            self.metrics.connection_closed(is_connect);
+            // 중복 호출 방지를 위해 제거: self.metrics.connection_closed(is_connect);
         }
 
         result
@@ -573,9 +570,32 @@ impl Session {
         }
     }
 
-    // 세션 ID 생성
+    // 세션 ID 생성 - 더 고유한 ID 생성을 위해 IP 주소와 포트 정보 추가
     fn session_id(&self) -> String {
-        format!("{:x}", self.start_time.elapsed().as_nanos() & 0xFFFFFF)
+        // IP 주소와 포트를 문자열로 변환
+        let ip_port = format!("{}", self.client_addr);
+        
+        // IP:PORT에서 숫자만 추출
+        let ip_nums: String = ip_port.chars()
+            .filter(|c| c.is_digit(10))
+            .collect();
+        
+        // 시간 정보와 IP 정보를 조합하여 더 고유한 ID 생성
+        let time_part = self.start_time.elapsed().as_nanos() & 0xFFFFFF;
+        let ip_part = if !ip_nums.is_empty() {
+            // IP 숫자의 마지막 부분만 사용 (최대 8자리)
+            let len = ip_nums.len();
+            let start = if len > 8 { len - 8 } else { 0 };
+            match ip_nums[start..].parse::<u64>() {
+                Ok(num) => num & 0xFFFFFF,
+                Err(_) => 0
+            }
+        } else {
+            0
+        };
+        
+        // 두 값을 XOR하여 더 고유한 값 생성
+        format!("{:x}_{:x}", time_part, ip_part)
     }
 
     // tcp 최적화

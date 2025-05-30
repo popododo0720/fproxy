@@ -54,4 +54,27 @@ impl QueryExecutor {
         
         row_mapper(row)
     }
+    
+    /// 여러 행 쿼리 실행 후 결과 벡터 반환
+    pub async fn query_rows<T, F>(
+        &self,
+        query: &str,
+        params: &[&(dyn ToSql + Sync)],
+        row_mapper: F
+    ) -> Result<Vec<T>, Box<dyn Error + Send + Sync>> 
+    where
+        F: Fn(Row) -> Result<T, Box<dyn Error + Send + Sync>>,
+    {
+        let client = self.pool.get_client().await?;
+        
+        trace!("다중 행 쿼리 실행: {}", query);
+        let rows = client.query(query, params).await?;
+        
+        let mut results = Vec::with_capacity(rows.len());
+        for row in rows {
+            results.push(row_mapper(row)?);
+        }
+        
+        Ok(results)
+    }
 } 
