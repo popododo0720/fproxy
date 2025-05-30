@@ -529,43 +529,38 @@ impl Metrics {
         
         // 마지막 메트릭스 값 조회
         match executor.query_one(proxy_stats::SELECT_LAST_METRICS, &[], |row| {
-            let http_conns: i64 = row.get(0);
-            let http_bytes_in: f64 = row.get(1);
-            let http_bytes_out: f64 = row.get(2);
-            let tls_conns: i64 = row.get(3);
-            let tls_bytes_in: f64 = row.get(4);
-            let tls_bytes_out: f64 = row.get(5);
+            let http_in: f64 = row.get(1);
+            let http_out: f64 = row.get(2);
+            let tls_in: f64 = row.get(4);
+            let tls_out: f64 = row.get(5);
             
             // MB에서 바이트로 변환 (데이터베이스에는 MB 단위로 저장됨)
-            let http_bytes_in_bytes = (http_bytes_in * 1024.0 * 1024.0) as u64;
-            let http_bytes_out_bytes = (http_bytes_out * 1024.0 * 1024.0) as u64;
-            let tls_bytes_in_bytes = (tls_bytes_in * 1024.0 * 1024.0) as u64;
-            let tls_bytes_out_bytes = (tls_bytes_out * 1024.0 * 1024.0) as u64;
+            let http_in_bytes = (http_in * 1024.0 * 1024.0) as u64;
+            let http_out_bytes = (http_out * 1024.0 * 1024.0) as u64;
+            let tls_in_bytes = (tls_in * 1024.0 * 1024.0) as u64;
+            let tls_out_bytes = (tls_out * 1024.0 * 1024.0) as u64;
             
             // 결과를 AtomicU64에 저장
             Ok((
-                http_conns as u64,
-                http_bytes_in_bytes,
-                http_bytes_out_bytes,
-                tls_conns as u64,
-                tls_bytes_in_bytes,
-                tls_bytes_out_bytes
+                http_in_bytes,
+                http_out_bytes,
+                tls_in_bytes,
+                tls_out_bytes
             ))
         }).await {
-            Ok((http_conns, http_in, http_out, tls_conns, tls_in, tls_out)) => {
+            Ok((http_in, http_out, tls_in, tls_out)) => {
                 // 값을 AtomicU64에 저장
-                self.http_active_connections.store(http_conns, Ordering::SeqCst);
+                // 활성 연결 수는 프로그램 재시작 시 0으로 시작 (모든 연결이 종료되기 때문)
+                self.http_active_connections.store(0, Ordering::SeqCst);
                 self.http_bytes_transferred_in.store(http_in, Ordering::SeqCst);
                 self.http_bytes_transferred_out.store(http_out, Ordering::SeqCst);
-                self.tls_active_connections.store(tls_conns, Ordering::SeqCst);
+                self.tls_active_connections.store(0, Ordering::SeqCst);
                 self.tls_bytes_transferred_in.store(tls_in, Ordering::SeqCst);
                 self.tls_bytes_transferred_out.store(tls_out, Ordering::SeqCst);
                 
-                info!("DB에서 로드된 메트릭스: HTTP 연결: {}, HTTP in: {:.2} MB, out: {:.2} MB, TLS 연결: {}, TLS in: {:.2} MB, out: {:.2} MB",
-                    http_conns,
+                info!("DB에서 로드된 메트릭스: HTTP in: {:.2} MB, out: {:.2} MB, TLS in: {:.2} MB, out: {:.2} MB",
                     Self::bytes_to_mb(http_in),
                     Self::bytes_to_mb(http_out),
-                    tls_conns,
                     Self::bytes_to_mb(tls_in),
                     Self::bytes_to_mb(tls_out)
                 );
