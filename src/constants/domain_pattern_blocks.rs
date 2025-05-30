@@ -12,7 +12,7 @@ pub const CHECK_TABLE_EXISTS: &str = "
 /// 테이블 생성 쿼리
 pub const CREATE_TABLE: &str = "
     CREATE TABLE IF NOT EXISTS domain_pattern_blocks (
-        id SERIAL PRIMARY KEY,
+        id BIGSERIAL PRIMARY KEY,
         pattern VARCHAR(255) NOT NULL,
         created_by VARCHAR(100) NOT NULL,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),

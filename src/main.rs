@@ -37,7 +37,7 @@ static FD_LIMIT: Lazy<u64> = Lazy::new(|| {
     std::env::var("FD_LIMIT")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(100000) // 기본값 100K
+        .unwrap_or(1000000) // 기본값 1M
 });
 
 // 전역 RequestLogger 인스턴스
