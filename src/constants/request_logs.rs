@@ -3,7 +3,7 @@
 /// 테이블 생성 쿼리
 pub const CREATE_TABLE: &str = "
     CREATE TABLE IF NOT EXISTS request_logs (
-        id SERIAL,
+        id BIGSERIAL,
         host TEXT NOT NULL,
         method TEXT NOT NULL,
         path TEXT NOT NULL,
@@ -15,7 +15,8 @@ pub const CREATE_TABLE: &str = "
         target_ip TEXT NOT NULL,
         response_time BIGINT,
         is_rejected BOOLEAN NOT NULL DEFAULT FALSE,
-        is_tls BOOLEAN NOT NULL DEFAULT FALSE
+        is_tls BOOLEAN NOT NULL DEFAULT FALSE,
+        PRIMARY KEY (id, timestamp)
     ) PARTITION BY RANGE (timestamp)";
 
 /// 기본 인덱스 생성 쿼리 - 부모 테이블에만 적용

@@ -40,4 +40,3 @@ panic = 'abort'    # 패닉 시 프로그램 종료
 codegen-units = 1  # 빌드 단위 최소화
 strip = true       # 심볼 정보 제거
 debug = false      # 디버그 정보 제거
-

@@ -10,7 +10,6 @@ use super::config::DbConfig;
 use crate::constants::request_logs;
 use crate::constants::proxy_stats;
 use crate::constants::proxy_stats_hourly;
-use crate::constants::partition;
 
 /// 테이블 유형 정의
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -40,77 +39,6 @@ impl PartitionManager {
     /// 새 PartitionManager 인스턴스 생성
     pub fn new(config: DbConfig) -> Self {
         Self { config }
-    }
-    
-    /// 파티션 관리 상태 확인 및 필요한 파티션 생성
-    pub async fn ensure_partitions(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let client = get_client().await?;
-        
-        // 테이블 생성
-        self.create_tables(&client).await?;
-        
-        // 파티션 생성 - 오늘과 미래 파티션 생성
-        let today = Local::now().date_naive();
-        let future_partitions = self.config.partitioning.future_partitions as i32;
-        
-        // 각 테이블별 파티션 생성
-        info!("테이블별 파티션 생성 (오늘 및 미래 {} 일분)", future_partitions);
-        
-        // request_logs 테이블 파티션 생성
-        info!("request_logs 테이블의 파티션 생성");
-        self.create_partitions(&client, TableType::RequestLogs, today, future_partitions + 1).await?;
-        
-        // proxy_stats 테이블 파티션 생성
-        info!("proxy_stats 테이블의 파티션 생성");
-        self.create_partitions(&client, TableType::ProxyStats, today, future_partitions + 1).await?;
-        
-        // proxy_stats_hourly 테이블 파티션 생성
-        info!("proxy_stats_hourly 테이블의 파티션 생성");
-        self.create_partitions(&client, TableType::ProxyStatsHourly, today, future_partitions + 1).await?;
-        
-        // 오래된 파티션 삭제
-        let older_than_days = self.config.partitioning.retention_period as i32;
-        
-        // 각 테이블별 오래된 파티션 삭제
-        let request_deleted = self.drop_old_partitions(&client, TableType::RequestLogs, older_than_days).await?;
-        info!("{} 개의 오래된 request_logs 파티션 삭제됨", request_deleted);
-        
-        let proxy_stats_deleted = self.drop_old_partitions(&client, TableType::ProxyStats, older_than_days).await?;
-        info!("{} 개의 오래된 proxy_stats 파티션 삭제됨", proxy_stats_deleted);
-        
-        let proxy_stats_hourly_deleted = self.drop_old_partitions(&client, TableType::ProxyStatsHourly, older_than_days).await?;
-        info!("{} 개의 오래된 proxy_stats_hourly 파티션 삭제됨", proxy_stats_hourly_deleted);
-        
-        Ok(())
-    }
-    
-    /// 테이블 생성
-    async fn create_tables(&self, client: &Client) -> Result<(), Box<dyn Error + Send + Sync>> {
-        // request_logs 테이블 생성
-        client.execute(request_logs::CREATE_TABLE, &[]).await?;
-        
-        // proxy_stats 테이블 생성
-        client.execute(proxy_stats::CREATE_TABLE, &[]).await?;
-        
-        // proxy_stats_hourly 테이블 생성
-        client.execute(proxy_stats_hourly::CREATE_TABLE, &[]).await?;
-        
-        // 인덱스 생성 - request_logs
-        for index_query in request_logs::CREATE_INDICES {
-            client.execute(index_query, &[]).await?;
-        }
-        
-        // 인덱스 생성 - proxy_stats
-        for index_query in proxy_stats::CREATE_INDICES {
-            client.execute(index_query, &[]).await?;
-        }
-        
-        // 인덱스 생성 - proxy_stats_hourly
-        for index_query in proxy_stats_hourly::CREATE_INDICES {
-            client.execute(index_query, &[]).await?;
-        }
-        
-        Ok(())
     }
     
     /// 다중 파티션 생성
@@ -221,10 +149,29 @@ impl PartitionManager {
         client: &Client,
         partition_name: &str
     ) -> Result<bool, Box<dyn Error + Send + Sync>> {
-        let row = client.query_one(partition::CHECK_PARTITION_EXISTS, &[&partition_name]).await?;
-        let exists: bool = row.get(0);
+        // 테이블 유형 확인
+        let table_type = if partition_name.starts_with("proxy_stats_hourly") {
+            TableType::ProxyStatsHourly
+        } else if partition_name.starts_with("proxy_stats") {
+            TableType::ProxyStats
+        } else {
+            TableType::RequestLogs
+        };
         
-        Ok(exists)
+        // 테이블 유형에 따라 적절한 쿼리 선택
+        let check_query = match table_type {
+            TableType::ProxyStatsHourly => crate::constants::proxy_stats_hourly::CHECK_PARTITION_EXISTS,
+            TableType::ProxyStats => crate::constants::proxy_stats::CHECK_PARTITION_EXISTS,
+            _ => "SELECT EXISTS (SELECT FROM pg_tables WHERE schemaname = 'public' AND tablename = $1)"
+        };
+        
+        match client.query_one(check_query, &[&partition_name]).await {
+            Ok(row) => Ok(row.get::<_, bool>(0)),
+            Err(e) => {
+                error!("파티션 존재 여부 확인 실패: {}", e);
+                Err(e.into())
+            }
+        }
     }
     
     /// 오래된 파티션 삭제
@@ -234,44 +181,34 @@ impl PartitionManager {
         table_type: TableType,
         older_than_days: i32
     ) -> Result<usize, Box<dyn Error + Send + Sync>> {
+        // 테이블 이름 가져오기
         let table_name = table_type.get_name();
-        let cutoff_date = Local::now().naive_local().date() - Duration::days(older_than_days as i64);
         
-        // 테이블 목록 조회
-        let pattern = format!("{}_%", table_name);
-        let rows = client.query(partition::LIST_TABLES_QUERY, &[&pattern]).await?;
+        // 기준 날짜 계산 (오늘 - older_than_days)
+        let cutoff_date = Local::now().date_naive() - chrono::Duration::days(older_than_days as i64);
+        let cutoff_str = format!("{:04}{:02}{:02}", cutoff_date.year(), cutoff_date.month(), cutoff_date.day());
+        
+        // 오래된 파티션 목록 조회
+        let rows = client.query(
+            crate::constants::partition::LIST_OLD_PARTITIONS, 
+            &[&table_name, &cutoff_str]
+        ).await?;
         
         let mut dropped_count = 0;
         
+        // 각 파티션 삭제
         for row in rows {
             let partition_name: String = row.get(0);
             
-            // 파티션 이름에서 날짜 추출 (table_YYYYMMDD 형식)
-            if let Some(date_str) = partition_name.strip_prefix(&format!("{}_", table_name)) {
-                if date_str.len() == 8 {
-                    // YYYYMMDD 형식 파싱
-                    if let Ok(year) = date_str[0..4].parse::<i32>() {
-                        if let Ok(month) = date_str[4..6].parse::<u32>() {
-                            if let Ok(day) = date_str[6..8].parse::<u32>() {
-                                // 날짜 객체 생성
-                                if let Some(partition_date) = chrono::NaiveDate::from_ymd_opt(year, month, day) {
-                                    // 기준일보다 오래된 파티션 삭제
-                                    if partition_date < cutoff_date {
-                                        let drop_sql = format!("DROP TABLE IF EXISTS {}", partition_name);
-                                        match client.execute(&drop_sql, &[]).await {
-                                            Ok(_) => {
-                                                info!("오래된 파티션 삭제: {}", partition_name);
-                                                dropped_count += 1;
-                                            },
-                                            Err(e) => {
-                                                error!("파티션 삭제 실패 - {}: {}", partition_name, e);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+            // 파티션 삭제 쿼리 실행
+            let drop_query = crate::constants::partition::DROP_PARTITION.replace("$1", &partition_name);
+            match client.execute(&drop_query, &[]).await {
+                Ok(_) => {
+                    debug!("오래된 파티션 삭제 완료: {}", partition_name);
+                    dropped_count += 1;
+                },
+                Err(e) => {
+                    error!("파티션 삭제 실패 - {}: {}", partition_name, e);
                 }
             }
         }
@@ -281,8 +218,6 @@ impl PartitionManager {
     
     /// 파티션 자동 생성 백그라운드 작업 시작
     pub async fn start_partition_scheduler(config: DbConfig) {
-        let future_partitions = config.partitioning.future_partitions as i32;
-        
         tokio::spawn(async move {
             info!("파티션 자동 생성 스케줄러 시작");
             
@@ -328,6 +263,9 @@ impl PartitionManager {
                 
                 match get_client().await {
                     Ok(client) => {
+                        // future_partitions 값은 partition_manager의 config에서 가져온 값 사용
+                        let future_partitions = partition_manager.config.partitioning.future_partitions as i32;
+                        
                         // request_logs 파티션 생성
                         match partition_manager.create_partitions(
                             &client, 
@@ -363,12 +301,18 @@ impl PartitionManager {
                         }
                         
                         // proxy_stats_hourly 파티션 생성
-                        match partition_manager.create_partitions(
-                            &client, 
-                            TableType::ProxyStatsHourly, 
-                            next_date, 
-                            future_partitions
-                        ).await {
+                        // 다음 달의 첫 날 계산
+                        let next_month_date = {
+                            let next_month = next_date.month() % 12 + 1;
+                            let next_year = if next_month == 1 {
+                                next_date.year() + 1
+                            } else {
+                                next_date.year()
+                            };
+                            chrono::NaiveDate::from_ymd_opt(next_year, next_month, 1).unwrap()
+                        };
+                        
+                        match partition_manager.create_monthly_partitions(&client, TableType::ProxyStatsHourly, next_month_date, future_partitions).await {
                             Ok(partitions) => {
                                 if !partitions.is_empty() {
                                     info!("proxy_stats_hourly 미래 파티션 생성 완료: {} 개", partitions.len());
@@ -389,6 +333,197 @@ impl PartitionManager {
             }
         });
     }
+
+    /// proxy_stats_hourly 테이블을 위한 월 단위 파티션 생성
+    async fn create_monthly_partitions(
+        &self,
+        client: &Client,
+        table_type: TableType,
+        start_month: chrono::NaiveDate,
+        num_months: i32
+    ) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
+        let mut created_partitions = Vec::new();
+        let table_name = table_type.get_name();
+        
+        // 월별 파티션 생성
+        for i in 0..num_months {
+            // 시작 월에 i개월 추가
+            let month_start = if i == 0 {
+                start_month
+            } else {
+                // 월 추가 계산
+                let year = start_month.year();
+                let month = start_month.month() as i32 + i;
+                let new_year = year + (month - 1) / 12;
+                let new_month = ((month - 1) % 12) + 1;
+                
+                chrono::NaiveDate::from_ymd_opt(new_year, new_month as u32, 1).unwrap_or(start_month)
+            };
+            
+            // 다음 월 계산
+            let next_month = if month_start.month() == 12 {
+                chrono::NaiveDate::from_ymd_opt(month_start.year() + 1, 1, 1).unwrap()
+            } else {
+                chrono::NaiveDate::from_ymd_opt(month_start.year(), month_start.month() + 1, 1).unwrap()
+            };
+            
+            // 파티션 이름 생성 (월 단위)
+            let partition_name = format!("{}_{:04}{:02}", 
+                table_name, 
+                month_start.year(), 
+                month_start.month()
+            );
+            
+            // 파티션이 이미 존재하는지 확인
+            if !self.partition_exists(client, &partition_name).await? {
+                // 타임아웃 설정으로 파티션 생성
+                match tokio::time::timeout(
+                    tokio::time::Duration::from_secs(5), // 5초 타임아웃
+                    self.create_monthly_partition(client, table_type, month_start, next_month)
+                ).await {
+                    Ok(Ok(name)) => {
+                        created_partitions.push(name);
+                    },
+                    Ok(Err(e)) => {
+                        error!("월별 파티션 생성 실패 - {}: {}", partition_name, e);
+                    },
+                    Err(_) => {
+                        error!("월별 파티션 생성 타임아웃 - {}", partition_name);
+                    }
+                }
+            } else {
+                debug!("월별 파티션이 이미 존재함: {}", partition_name);
+            }
+        }
+        
+        info!("테이블 {} 에 대해 {} 개의 월별 파티션 생성됨", table_name, created_partitions.len());
+        Ok(created_partitions)
+    }
+
+    /// 단일 월별 파티션 생성
+    async fn create_monthly_partition(
+        &self,
+        client: &Client,
+        table_type: TableType, 
+        month_start: chrono::NaiveDate,
+        next_month: chrono::NaiveDate
+    ) -> Result<String, Box<dyn Error + Send + Sync>> {
+        let table_name = table_type.get_name();
+        // 월별 파티션 이름 생성
+        let partition_name = format!("{}_{:04}{:02}", 
+            table_name, 
+            month_start.year(), 
+            month_start.month()
+        );
+        
+        // 파티션 생성
+        let create_partition_sql = match table_type {
+            TableType::ProxyStatsHourly => {
+                // proxy_stats_hourly 테이블은 월 단위 파티션 포맷 사용
+                let from_ts = format!("{}-{:02}-01 00:00:00", month_start.year(), month_start.month());
+                let to_ts = format!("{}-{:02}-01 00:00:00", next_month.year(), next_month.month());
+                
+                debug!("월별 파티션 생성 쿼리 - 파티션: {}, 범위: {} ~ {}", partition_name, from_ts, to_ts);
+                
+                // 직접 쿼리 작성
+                format!(
+                    "{}",
+                    crate::constants::partition::CREATE_MONTHLY_PARTITION
+                ).replace("{}", &partition_name)
+                 .replace("{}", &table_name)
+                 .replace("{}", &from_ts)
+                 .replace("{}", &to_ts)
+            },
+            _ => {
+                // 다른 테이블은 기존 방식 사용
+                format!(
+                    "CREATE TABLE IF NOT EXISTS {} PARTITION OF {} 
+                     FOR VALUES FROM ('{}') TO ('{}')",
+                    partition_name, table_name,
+                    month_start, next_month
+                )
+            }
+        };
+        
+        client.execute(&create_partition_sql, &[]).await?;
+        
+        // proxy_stats_hourly 테이블 전용 인덱스 생성
+        if table_type == TableType::ProxyStatsHourly {
+            // 인덱스 생성 쿼리 포맷 사용
+            let create_index_query = format!(
+                "{}",
+                crate::constants::proxy_stats_hourly::CREATE_PARTITION_INDEX_FORMAT
+            ).replace("{}", &partition_name)
+             .replace("{}", &partition_name);
+             
+            client.execute(&create_index_query, &[]).await?;
+        }
+        
+        debug!("월별 파티션 생성 완료: {}", partition_name);
+        Ok(partition_name)
+    }
+}
+
+/// 테이블 생성
+async fn create_tables(client: &Client) -> Result<(), Box<dyn Error + Send + Sync>> {
+    // 각 테이블을 개별적으로 생성하고 인덱스를 적용
+    
+    // 1. request_logs 테이블 생성 및 인덱스 적용
+    match client.execute(request_logs::CREATE_TABLE, &[]).await {
+        Ok(_) => {
+            info!("request_logs 테이블 생성 확인 완료");
+            // request_logs 인덱스 생성
+            for index_query in request_logs::CREATE_INDICES {
+                if let Err(e) = client.execute(index_query, &[]).await {
+                    error!("request_logs 인덱스 생성 실패: {}", e);
+                    // 인덱스 생성 실패는 무시하고 계속 진행
+                }
+            }
+        },
+        Err(e) => {
+            error!("request_logs 테이블 생성 실패: {}", e);
+            // 테이블 생성 실패는 무시하고 계속 진행
+        }
+    }
+    
+    // 2. proxy_stats 테이블 생성 및 인덱스 적용
+    match client.execute(proxy_stats::CREATE_TABLE, &[]).await {
+        Ok(_) => {
+            info!("proxy_stats 테이블 생성 확인 완료");
+            // proxy_stats 인덱스 생성
+            for index_query in proxy_stats::CREATE_INDICES {
+                if let Err(e) = client.execute(index_query, &[]).await {
+                    error!("proxy_stats 인덱스 생성 실패: {}", e);
+                    // 인덱스 생성 실패는 무시하고 계속 진행
+                }
+            }
+        },
+        Err(e) => {
+            error!("proxy_stats 테이블 생성 실패: {}", e);
+            // 테이블 생성 실패는 무시하고 계속 진행
+        }
+    }
+    
+    // 3. proxy_stats_hourly 테이블 생성 및 인덱스 적용
+    match client.execute(proxy_stats_hourly::CREATE_TABLE, &[]).await {
+        Ok(_) => {
+            info!("proxy_stats_hourly 테이블 생성 확인 완료");
+            // proxy_stats_hourly 인덱스 생성
+            for index_query in proxy_stats_hourly::CREATE_INDICES {
+                if let Err(e) = client.execute(index_query, &[]).await {
+                    error!("proxy_stats_hourly 인덱스 생성 실패: {}", e);
+                    // 인덱스 생성 실패는 무시하고 계속 진행
+                }
+            }
+        },
+        Err(e) => {
+            error!("proxy_stats_hourly 테이블 생성 실패: {}", e);
+            // 테이블 생성 실패는 무시하고 계속 진행
+        }
+    }
+    
+    // 모든 테이블 생성 시도 후 성공으로 처리
+    Ok(())
 }
 
 /// 파티션 상태 확인 함수 (전역 함수)
@@ -405,31 +540,78 @@ pub async fn ensure_partitions() -> Result<(), Box<dyn Error + Send + Sync>> {
             
             // 파티션 관리자 생성 및 파티션 확인 - 타임아웃 적용
             let partition_manager = PartitionManager::new(db_config.clone());
-            match tokio::time::timeout(
-                tokio::time::Duration::from_secs(60), // 60초 타임아웃
-                partition_manager.ensure_partitions()
-            ).await {
-                Ok(Ok(_)) => {
-                    info!("데이터베이스 파티션 상태 확인 완료");
-                    
-                    // 파티션 자동 생성 스케줄러 시작
-                    PartitionManager::start_partition_scheduler(db_config).await;
-                    
-                    Ok(())
-                },
-                Ok(Err(e)) => {
-                    error!("데이터베이스 파티션 확인 실패: {}", e);
-                    Err(e)
-                },
-                Err(_) => {
-                    error!("데이터베이스 파티션 확인 타임아웃 발생, 계속 진행합니다");
-                    
-                    // 타임아웃 발생해도 파티션 스케줄러는 시작
-                    PartitionManager::start_partition_scheduler(db_config).await;
-                    
-                    Ok(()) // 타임아웃 발생 시에도 프로그램이 계속 실행되도록 Ok 반환
+            
+            // 테이블 생성 확인
+            let client = match get_client().await {
+                Ok(client) => client,
+                Err(e) => {
+                    error!("DB 연결 실패: {}", e);
+                    return Err(Box::new(e));
                 }
+            };
+            
+            // 테이블 생성 확인 - 오류가 발생해도 계속 진행
+            if let Err(e) = create_tables(&client).await {
+                error!("테이블 생성 중 일부 오류 발생: {}", e);
+                // 오류가 발생해도 계속 진행
+            } else {
+                info!("테이블 생성 확인 완료");
             }
+            
+            // 오늘 날짜 계산
+            let today = Local::now().date_naive();
+            let future_partitions = db_config.partitioning.future_partitions as i32;
+            
+            // 각 테이블 유형별로 개별적으로 파티션 생성 시도
+            // request_logs 테이블 파티션 생성 (일 단위)
+            info!("request_logs 테이블의 파티션 생성");
+            match partition_manager.create_partitions(&client, TableType::RequestLogs, today, future_partitions + 1).await {
+                Ok(_) => info!("request_logs 파티션 생성 완료"),
+                Err(e) => error!("request_logs 파티션 생성 실패: {}", e)
+            }
+
+            // proxy_stats 테이블 파티션 생성 (일 단위)
+            info!("proxy_stats 테이블의 파티션 생성");
+            match partition_manager.create_partitions(&client, TableType::ProxyStats, today, future_partitions + 1).await {
+                Ok(_) => info!("proxy_stats 파티션 생성 완료"),
+                Err(e) => error!("proxy_stats 파티션 생성 실패: {}", e)
+            }
+            
+            // proxy_stats_hourly 테이블 파티션 생성 (월 단위)
+            info!("proxy_stats_hourly 테이블의 월별 파티션 생성");
+            // 현재 월의 첫날
+            let current_month_start = chrono::NaiveDate::from_ymd_opt(today.year(), today.month(), 1).unwrap();
+            
+            match partition_manager.create_monthly_partitions(&client, TableType::ProxyStatsHourly, current_month_start, 2).await {
+                Ok(_) => info!("proxy_stats_hourly 월별 파티션 생성 완료"),
+                Err(e) => error!("proxy_stats_hourly 월별 파티션 생성 실패: {}", e)
+            }
+            
+            // 오래된 파티션 삭제 시도
+            let older_than_days = db_config.partitioning.retention_period as i32;
+            
+            // 각 테이블별 오래된 파티션 삭제
+            match partition_manager.drop_old_partitions(&client, TableType::RequestLogs, older_than_days).await {
+                Ok(count) => info!("{} 개의 오래된 request_logs 파티션 삭제됨", count),
+                Err(e) => error!("request_logs 오래된 파티션 삭제 실패: {}", e)
+            }
+            
+            match partition_manager.drop_old_partitions(&client, TableType::ProxyStats, older_than_days).await {
+                Ok(count) => info!("{} 개의 오래된 proxy_stats 파티션 삭제됨", count),
+                Err(e) => error!("proxy_stats 오래된 파티션 삭제 실패: {}", e)
+            }
+            
+            match partition_manager.drop_old_partitions(&client, TableType::ProxyStatsHourly, older_than_days).await {
+                Ok(count) => info!("{} 개의 오래된 proxy_stats_hourly 파티션 삭제됨", count),
+                Err(e) => error!("proxy_stats_hourly 오래된 파티션 삭제 실패: {}", e)
+            }
+            
+            info!("데이터베이스 파티션 상태 확인 완료");
+            
+            // 파티션 자동 생성 스케줄러 시작
+            PartitionManager::start_partition_scheduler(db_config).await;
+            
+            Ok(())
         },
         Err(e) => {
             error!("DB 설정 로드 실패: {}", e);
