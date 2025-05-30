@@ -341,31 +341,41 @@ pub async fn proxy_tls_streams(
                                               session_id, current_response_for);
                                     }
                                     
-                                    // 응답 시간 계산
-                                    let mut times = request_times.write().unwrap();
-                                    if let Some(start_time) = times.remove(&current_response_for) {
-                                        let response_time = start_time.elapsed().as_millis() as u64;
-                                        
+                                    // 응답 시간 계산 - 락 범위를 최소화
+                                    let response_time = {
+                                        let mut times = request_times.write().unwrap();
+                                        if let Some(start_time) = times.remove(&current_response_for) {
+                                            let rt = start_time.elapsed().as_millis() as u64;
+                                            Some(rt)
+                                        } else {
+                                            None
+                                        }
+                                    };
+                                    
+                                    if let Some(response_time) = response_time {
                                         // 응답 시간 로그 기록
                                         info!("[Session:{}] HTTPS 요청 #{} 완료, 응답 시간: {} ms", 
                                              session_id, current_response_for, response_time);
                                         
                                         // DB에 응답 시간 기록
                                         if let Ok(logger) = REQUEST_LOGGER.try_read() {
-                                            // 응답 시간 업데이트 함수 호출
-                                            tokio::spawn({
-                                                let logger = logger.clone();
-                                                let session_id = session_id.to_string();
-                                                async move {
-                                                    if let Err(e) = logger.update_response_time(&session_id, response_time).await {
-                                                        debug!("[Session:{}] 응답 시간 업데이트 실패: {}", session_id, e);
-                                                    }
+                                            // 응답 시간 업데이트 함수 직접 호출
+                                            let session_id_str = session_id.to_string(); // 세션 ID 복사
+                                            let response_time_copy = response_time;
+                                            
+                                            tokio::spawn(async move {
+                                                match logger.update_response_time(&session_id_str, response_time_copy).await {
+                                                    Ok(_) => debug!("[Session:{}] 응답 시간 업데이트 성공: {}ms", session_id_str, response_time_copy),
+                                                    Err(e) => warn!("[Session:{}] 응답 시간 업데이트 실패: {}", session_id_str, e)
                                                 }
                                             });
                                         }
                                         
-                                        // 요청 파싱 상태 초기화
-                                        *parsing_request.write().unwrap() = false;
+                                        // 요청 파싱 상태 초기화 - 락 범위 최소화
+                                        {
+                                            let mut parsing = parsing_request.write().unwrap();
+                                            *parsing = false;
+                                        }
                                     } else {
                                         warn!("[Session:{}] HTTPS 요청 #{} 완료되었으나 시작 시간을 찾을 수 없음", 
                                              session_id, current_response_for);
@@ -417,6 +427,23 @@ pub async fn proxy_tls_streams(
     for (req_id, start_time) in times.iter() {
         let response_time = start_time.elapsed().as_millis() as u64;
         warn!("[Session:{}] HTTPS 요청 #{} 미완료 종료, 시간: {} ms", session_id, req_id, response_time);
+        
+        // 미완료 요청에 대해 응답 시간 기록
+        if let Ok(logger) = REQUEST_LOGGER.try_read() {
+            // 세션 ID 복사 및 별도 태스크로 실행하여 블로킹 방지
+            let session_id_str = session_id.to_string();
+            let req_id_copy = *req_id;
+            let response_time_copy = response_time;
+            
+            tokio::spawn(async move {
+                match logger.update_response_time(&session_id_str, response_time_copy).await {
+                    Ok(_) => debug!("[Session:{}] 미완료 요청 #{} 응답 시간 업데이트 성공: {}ms", 
+                                   session_id_str, req_id_copy, response_time_copy),
+                    Err(e) => warn!("[Session:{}] 미완료 요청 #{} 응답 시간 업데이트 실패: {}", 
+                                   session_id_str, req_id_copy, e)
+                }
+            });
+        }
     }
     
     // 세션 전체 시간도 기록 (디버깅 및 모니터링용)

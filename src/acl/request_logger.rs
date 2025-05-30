@@ -28,6 +28,10 @@ pub enum LogMessage {
         is_rejected: bool,
         is_tls: bool
     },
+    ResponseTimeUpdate {
+        session_id: String,
+        response_time: u64,
+    },
     FlushLogs,
 }
 
@@ -35,6 +39,13 @@ pub enum LogMessage {
 #[derive(Default)]
 struct LogBatch {
     request_logs: Vec<(String, String, String, String, Option<String>, DateTime<Utc>, String, String, String, Option<u64>, bool, bool)>, // host, method, path, header, body, timestamp, session_id, client_ip, target_ip, response_time, is_rejected, is_tls
+    size: usize,
+}
+
+/// 응답 시간 업데이트 배치 구조체
+#[derive(Default)]
+struct ResponseTimeBatch {
+    updates: Vec<(String, u64)>, // (session_id, response_time)
     size: usize,
 }
 
@@ -139,6 +150,61 @@ impl LogBatch {
     }
 }
 
+impl ResponseTimeBatch {
+    fn new() -> Self {
+        Self {
+            updates: Vec::with_capacity(LOG_BATCH_SIZE),
+            size: 0,
+        }
+    }
+    
+    fn add_update(&mut self, session_id: String, response_time: u64) {
+        self.updates.push((session_id, response_time));
+        self.size += 1;
+    }
+    
+    fn should_flush(&self) -> bool {
+        self.updates.len() >= LOG_BATCH_SIZE / 2 // 요청 로그의 절반 크기로 설정
+    }
+    
+    fn is_empty(&self) -> bool {
+        self.updates.is_empty()
+    }
+    
+    fn clear(&mut self) {
+        self.updates.clear();
+        self.size = 0;
+    }
+    
+    // 배치 업데이트 쿼리 생성
+    fn create_batch_query(&self) -> (String, Vec<String>) {
+        let mut session_ids = Vec::with_capacity(self.updates.len());
+        
+        // CASE 문을 사용한 업데이트 쿼리 생성
+        let mut query = "
+            UPDATE request_logs
+            SET response_time = CASE session_id ".to_string();
+            
+        for (session_id, response_time) in &self.updates {
+            query.push_str(&format!("WHEN '{}' THEN {} ", session_id, response_time));
+            session_ids.push(session_id.clone());
+        }
+        
+        query.push_str("END WHERE session_id IN (");
+        
+        for (i, session_id) in session_ids.iter().enumerate() {
+            if i > 0 {
+                query.push_str(", ");
+            }
+            query.push_str(&format!("'{}'", session_id));
+        }
+        
+        query.push_str(") AND timestamp > NOW() - INTERVAL '3 hour' AND response_time IS NULL");
+        
+        (query, session_ids)
+    }
+}
+
 /// TLS 요청 로깅을 담당하는 구조체
 #[derive(Clone)]
 pub struct RequestLogger {
@@ -205,6 +271,7 @@ impl RequestLogger {
     /// 로그 작성 태스크
     async fn log_writer_task(mut rx: Receiver<LogMessage>) {
         let mut log_batch = LogBatch::new();
+        let mut response_time_batch = ResponseTimeBatch::new();
         let mut last_flush_time = Instant::now();
         
         // 배치 플러시 주기
@@ -222,21 +289,51 @@ impl RequestLogger {
                         last_flush_time = Instant::now();
                     }
                 },
+                LogMessage::ResponseTimeUpdate { session_id, response_time } => {
+                    debug!("[Session:{}] 응답 시간 업데이트 배치에 추가: {}ms", session_id, response_time);
+                    response_time_batch.add_update(session_id, response_time);
+                    
+                    if response_time_batch.should_flush() {
+                        if let Err(e) = Self::flush_response_time_batch(&mut response_time_batch).await {
+                            error!("응답 시간 배치 플러시 실패: {}", e);
+                        }
+                    }
+                },
                 LogMessage::FlushLogs => {
+                    // 로그 배치 플러시
                     if !log_batch.is_empty() {
                         if let Err(e) = Self::flush_log_batch(&mut log_batch).await {
                             error!("로그 배치 플러시 실패: {}", e);
                         }
-                        last_flush_time = Instant::now();
                     }
+                    
+                    // 응답 시간 배치 플러시
+                    if !response_time_batch.is_empty() {
+                        if let Err(e) = Self::flush_response_time_batch(&mut response_time_batch).await {
+                            error!("응답 시간 배치 플러시 실패: {}", e);
+                        }
+                    }
+                    
+                    last_flush_time = Instant::now();
                 }
             }
             
             // 일정 시간이 지나면 배치 플러시
-            if last_flush_time.elapsed() >= flush_interval && !log_batch.is_empty() {
-                if let Err(e) = Self::flush_log_batch(&mut log_batch).await {
-                    error!("로그 배치 플러시 실패: {}", e);
+            if last_flush_time.elapsed() >= flush_interval {
+                // 로그 배치 플러시
+                if !log_batch.is_empty() {
+                    if let Err(e) = Self::flush_log_batch(&mut log_batch).await {
+                        error!("로그 배치 플러시 실패: {}", e);
+                    }
                 }
+                
+                // 응답 시간 배치 플러시
+                if !response_time_batch.is_empty() {
+                    if let Err(e) = Self::flush_response_time_batch(&mut response_time_batch).await {
+                        error!("응답 시간 배치 플러시 실패: {}", e);
+                    }
+                }
+                
                 last_flush_time = Instant::now();
             }
         }
@@ -353,6 +450,109 @@ impl RequestLogger {
         Ok(())
     }
     
+    /// 응답 시간 배치 플러시
+    async fn flush_response_time_batch(batch: &mut ResponseTimeBatch) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        
+        debug!("응답 시간 배치 플러시 중: {} 항목", batch.updates.len());
+        
+        // 쿼리 실행기 가져오기
+        let executor = match db::query::QueryExecutor::get_instance().await {
+            Ok(executor) => executor,
+            Err(e) => {
+                error!("쿼리 실행기 가져오기 실패: {}", e);
+                return Err(e.into());
+            }
+        };
+        
+        // 배치 쿼리 생성
+        let (query, _session_ids) = batch.create_batch_query();
+        
+        // 쿼리 실행
+        match executor.execute_query(&query, &[]).await {
+            Ok(rows) => {
+                debug!("응답 시간 배치 업데이트 성공: {} 개의 세션 중 {} 개 업데이트됨", 
+                      batch.updates.len(), rows);
+                
+                // 업데이트된 행이 없는 경우 개별 업데이트 시도
+                if rows == 0 && !batch.updates.is_empty() {
+                    debug!("배치 업데이트에 실패한 세션에 대해 개별 업데이트 시도");
+                    
+                    // 최대 10개까지만 개별 업데이트 시도 (성능 이슈 방지)
+                    let max_individual_attempts = 10.min(batch.updates.len());
+                    
+                    for i in 0..max_individual_attempts {
+                        let (session_id, response_time) = &batch.updates[i];
+                        
+                        // 개별 업데이트 쿼리 - 더 넓은 시간 범위로 수정
+                        let individual_query = "
+                            UPDATE request_logs 
+                            SET response_time = $1 
+                            WHERE id = (
+                                SELECT id 
+                                FROM request_logs 
+                                WHERE session_id = $2 
+                                AND timestamp > NOW() - INTERVAL '24 hour'
+                                AND response_time IS NULL
+                                ORDER BY timestamp DESC
+                                LIMIT 1
+                            )";
+                        
+                        let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
+                            &(*response_time as i64),
+                            &session_id
+                        ];
+                        
+                        match executor.execute_query(individual_query, params).await {
+                            Ok(updated) => {
+                                if updated > 0 {
+                                    debug!("[Session:{}] 개별 응답 시간 업데이트 성공: {}ms", session_id, response_time);
+                                } else {
+                                    // 업데이트된 행이 없는 경우 더 넓은 시간 범위로 다시 시도
+                                    let wider_query = "
+                                        UPDATE request_logs 
+                                        SET response_time = $1 
+                                        WHERE id = (
+                                            SELECT id 
+                                            FROM request_logs 
+                                            WHERE session_id = $2 
+                                            AND response_time IS NULL
+                                            ORDER BY timestamp DESC
+                                            LIMIT 1
+                                        )";
+                                    
+                                    match executor.execute_query(wider_query, params).await {
+                                        Ok(wider_updated) => {
+                                            if wider_updated > 0 {
+                                                debug!("[Session:{}] 넓은 범위 응답 시간 업데이트 성공: {}ms", session_id, response_time);
+                                            } else {
+                                                debug!("[Session:{}] 응답 시간 업데이트 실패: 매칭되는 요청 레코드 없음", session_id);
+                                            }
+                                        },
+                                        Err(e) => {
+                                            debug!("[Session:{}] 넓은 범위 응답 시간 업데이트 실패: {}", session_id, e);
+                                        }
+                                    }
+                                }
+                            },
+                            Err(e) => {
+                                debug!("[Session:{}] 개별 응답 시간 업데이트 실패: {}", session_id, e);
+                            }
+                        }
+                    }
+                }
+            },
+            Err(e) => {
+                error!("응답 시간 배치 업데이트 실패: {}", e);
+            }
+        }
+        
+        batch.clear();
+        Ok(())
+    }
+    
     /// 비동기 로그 기록
     pub fn log_async<'a>(
         &self, 
@@ -434,18 +634,62 @@ impl RequestLogger {
         }
     }
     
-    /// 응답 시간 업데이트 - 배치 업데이트 지원
+    /// 응답 시간 업데이트 - 배치 처리 지원
     pub async fn update_response_time(&self, session_id: &str, response_time: u64) -> Result<(), Box<dyn Error + Send + Sync>> {
+        match &self.log_sender {
+            Some(sender) => {
+                // 응답 시간 업데이트 메시지를 채널로 전송
+                let message = LogMessage::ResponseTimeUpdate {
+                    session_id: session_id.to_string(),
+                    response_time,
+                };
+                
+                // 메시지 전송 시도
+                match sender.try_send(message) {
+                    Ok(_) => {
+                        debug!("[Session:{}] 응답 시간 업데이트 메시지 전송 성공: {}ms", session_id, response_time);
+                        Ok(())
+                    },
+                    Err(e) => {
+                        // 채널이 가득 찬 경우 직접 업데이트 시도
+                        match e {
+                            tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                                warn!("[Session:{}] 응답 시간 업데이트 채널이 가득 참, 직접 업데이트 시도: {}ms", 
+                                     session_id, response_time);
+                                self.update_response_time_direct(session_id, response_time).await
+                            },
+                            _ => {
+                                error!("[Session:{}] 응답 시간 업데이트 메시지 전송 실패: {}", session_id, e);
+                                Err(Box::new(std::io::Error::new(
+                                    std::io::ErrorKind::Other, 
+                                    format!("응답 시간 업데이트 메시지 전송 실패: {}", e)
+                                )))
+                            }
+                        }
+                    }
+                }
+            },
+            None => {
+                // 로그 채널이 초기화되지 않은 경우 직접 업데이트
+                warn!("[Session:{}] 로그 채널이 초기화되지 않음, 직접 응답 시간 업데이트 시도: {}ms", 
+                     session_id, response_time);
+                self.update_response_time_direct(session_id, response_time).await
+            }
+        }
+    }
+    
+    /// 응답 시간 직접 업데이트 (채널 사용 불가 시 대체 방법)
+    async fn update_response_time_direct(&self, session_id: &str, response_time: u64) -> Result<(), Box<dyn Error + Send + Sync>> {
         // DB 연결 획득
         let executor = match db::query::QueryExecutor::get_instance().await {
             Ok(executor) => executor,
             Err(e) => {
-                error!("응답 시간 업데이트를 위한 쿼리 실행기 가져오기 실패: {}", e);
+                error!("응답 시간 직접 업데이트를 위한 쿼리 실행기 가져오기 실패: {}", e);
                 return Err(e.into());
             }
         };
         
-        // 업데이트 쿼리 실행 - 서브쿼리를 사용하여 ORDER BY와 LIMIT 문제 해결
+        // 업데이트 쿼리 실행 - 최근 요청 우선으로 검색
         let query = "
             UPDATE request_logs 
             SET response_time = $1 
@@ -453,7 +697,6 @@ impl RequestLogger {
                 SELECT id 
                 FROM request_logs 
                 WHERE session_id = $2 
-                AND timestamp > NOW() - INTERVAL '1 hour'
                 AND response_time IS NULL
                 ORDER BY timestamp DESC
                 LIMIT 1
@@ -464,20 +707,95 @@ impl RequestLogger {
             &session_id
         ];
         
-        match executor.execute_query(query, params).await {
-            Ok(rows) => {
-                if rows > 0 {
-                    debug!("[Session:{}] 응답 시간 업데이트 성공: {}ms", session_id, response_time);
-                } else {
-                    debug!("[Session:{}] 응답 시간 업데이트할 로그 레코드를 찾을 수 없음", session_id);
+        // 최대 2번까지만 재시도 (직접 업데이트는 빠르게 결정)
+        let mut attempts = 0;
+        let max_attempts = 2;
+        
+        while attempts < max_attempts {
+            match executor.execute_query(query, params).await {
+                Ok(rows) => {
+                    if rows > 0 {
+                        info!("[Session:{}] 응답 시간 직접 업데이트 성공: {}ms", session_id, response_time);
+                        return Ok(());
+                    }
+                    
+                    // 업데이트된 행이 없으면 더 넓은 시간 범위로 다시 시도
+                    if attempts == max_attempts - 1 {
+                        // 세션 ID로만 검색하여 가장 최근 요청에 응답 시간 업데이트
+                        debug!("[Session:{}] 기본 쿼리로 응답 시간 업데이트 실패, 확장 쿼리 시도", session_id);
+                        
+                        // 최근 24시간 내 요청 중 가장 최근 요청 찾기
+                        let find_query = "
+                            SELECT id, timestamp 
+                            FROM request_logs 
+                            WHERE session_id = $1 
+                            AND response_time IS NULL
+                            ORDER BY timestamp DESC
+                            LIMIT 3";
+                        
+                        let find_params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&session_id];
+                        
+                        match executor.query_rows(find_query, find_params, |row| {
+                            let id: i64 = row.get(0);
+                            let timestamp: chrono::DateTime<chrono::Utc> = row.get(1);
+                            Ok((id, timestamp))
+                        }).await {
+                            Ok(results) => {
+                                if !results.is_empty() {
+                                    let (id, timestamp) = &results[0];
+                                    debug!("[Session:{}] 응답 시간 업데이트할 요청 찾음: ID={}, 시간={}", 
+                                          session_id, id, timestamp);
+                                    
+                                    // 특정 ID로 직접 업데이트
+                                    let direct_query = "UPDATE request_logs SET response_time = $1 WHERE id = $2";
+                                    let direct_params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
+                                        &(response_time as i64),
+                                        id
+                                    ];
+                                    
+                                    match executor.execute_query(direct_query, direct_params).await {
+                                        Ok(updated) => {
+                                            if updated > 0 {
+                                                info!("[Session:{}] ID 기반 응답 시간 업데이트 성공: ID={}, 시간={}ms", 
+                                                     session_id, id, response_time);
+                                                return Ok(());
+                                            } else {
+                                                warn!("[Session:{}] ID 기반 응답 시간 업데이트 실패: ID={}", session_id, id);
+                                            }
+                                        },
+                                        Err(e) => {
+                                            error!("[Session:{}] ID 기반 응답 시간 업데이트 오류: {}", session_id, e);
+                                        }
+                                    }
+                                } else {
+                                    debug!("[Session:{}] 응답 시간을 업데이트할 요청을 찾을 수 없음", session_id);
+                                }
+                            },
+                            Err(e) => {
+                                error!("[Session:{}] 응답 시간 업데이트할 요청 검색 실패: {}", session_id, e);
+                            }
+                        }
+                    }
+                },
+                Err(e) => {
+                    error!("[Session:{}] 응답 시간 직접 업데이트 실패: {}", session_id, e);
+                    if attempts == max_attempts - 1 {
+                        return Err(e.into());
+                    }
                 }
-                Ok(())
-            },
-            Err(e) => {
-                error!("[Session:{}] 응답 시간 업데이트 실패: {}", session_id, e);
-                Err(e.into())
             }
+            
+            // 재시도 전 짧은 지연
+            if attempts < max_attempts - 1 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+            }
+            
+            attempts += 1;
         }
+        
+        // 모든 시도 실패했지만 세션 진행에 영향을 주지 않도록 에러를 반환하지 않음
+        debug!("[Session:{}] 응답 시간 직접 업데이트 실패 (레코드를 찾을 수 없음)", session_id);
+        Ok(())
     }
     
     /// 차단 로깅을 위한 요청 파싱
