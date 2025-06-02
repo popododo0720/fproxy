@@ -1,4 +1,3 @@
-use std::error::Error;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::Arc;
@@ -21,6 +20,7 @@ use crate::proxy::tls::proxy_tls_streams;
 use crate::acl::domain_blocker::DomainBlocker;
 use crate::acl::block_page::BlockPage;
 use crate::logging::Logger;
+use crate::error::{ProxyError, Result, http_err, internal_err, tls_err};
 
 /// HTTP 요청 파싱 결과
 #[derive(Debug)]
@@ -67,7 +67,7 @@ impl Session {
         }
     }
 
-    pub async fn handle(mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
+    pub async fn handle(mut self) -> Result<()> {
         info!("[Session:{}] session start, addr: {}", self.session_id(), self.client_addr);
 
         let mut client_stream = match self.client_stream.take() {
@@ -172,7 +172,7 @@ impl Session {
     }
     
     /// 클라이언트 요청 읽기
-    async fn read_client_request(&self, client_stream: &mut TcpStream, buffer: &mut BytesMut) -> Result<usize, Box<dyn Error + Send + Sync>> {
+    async fn read_client_request(&self, client_stream: &mut TcpStream, buffer: &mut BytesMut) -> Result<usize> {
         match tokio::time::timeout(
             Duration::from_millis(self.config.timeout_ms as u64),
             client_stream.read_buf(buffer),
@@ -180,20 +180,17 @@ impl Session {
             Ok(Ok(n)) => Ok(n),
             Ok(Err(e)) => {
                 error!("[Session:{}] read client request failed: {}", self.session_id(), e);
-                Err(Box::new(e))
+                Err(ProxyError::from(e))
             },
             Err(_) => {
                 error!("[Session:{}] client request read timed out", self.session_id());
-                Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "client request read timed out"
-                )))
+                Err(ProxyError::Timeout("client request read timed out".to_string()))
             }
         }
     }
     
     /// HTTP 요청 파싱
-    fn parse_http_request(&self, request_str: &str) -> Result<HttpRequest, Box<dyn Error + Send + Sync>> {
+    fn parse_http_request(&self, request_str: &str) -> Result<HttpRequest> {
         let first_line = request_str.lines().next().unwrap_or("");
         debug!("[Session:{}] request first line: {}", self.session_id(), first_line);
 
@@ -220,7 +217,7 @@ impl Session {
                     let port = host_port[idx+1..].parse::<u16>()
                         .map_err(|_| {
                             error!("[Session:{}] Invalid port in CONNECT request", self.session_id());
-                            std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid port")
+                            ProxyError::Http("Invalid port in CONNECT request".to_string())
                         })?;
                     
                     Ok(HttpRequest {
@@ -237,7 +234,7 @@ impl Session {
                 }
             } else {
                 error!("[Session:{}] Missing host in CONNECT request", self.session_id());
-                Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Missing host").into())
+                Err(ProxyError::Http("Missing host in CONNECT request".to_string()))
             }
         } else {
             // HTTP 메서드 파싱
@@ -275,18 +272,18 @@ impl Session {
                             }
                         } else {
                             error!("[Session:{}] Invalid host in URL", self.session_id());
-                            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid host in URL").into());
+                            return Err(ProxyError::Http("Invalid host in URL".to_string()));
                         }
                     } else {
                         error!("[Session:{}] Invalid URL format", self.session_id());
-                        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid URL format").into());
+                        return Err(ProxyError::Http("Invalid URL format".to_string()));
                     }
                 }
             }
             
             if host.is_empty() {
                 error!("[Session:{}] Missing host header and invalid URL", self.session_id());
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Missing host information").into());
+                return Err(ProxyError::Http("Missing host information".to_string()));
             }
             
             Ok(HttpRequest {
@@ -298,7 +295,7 @@ impl Session {
     }
     
     /// 차단된 도메인 처리
-    async fn handle_blocked_domain(&self, mut client_stream: TcpStream, host: &str, is_connect: bool, request_str: &str, buffer: BytesMut) -> Result<(), Box<dyn Error + Send + Sync>> {
+    async fn handle_blocked_domain(&self, mut client_stream: TcpStream, host: &str, is_connect: bool, request_str: &str, buffer: BytesMut) -> Result<()> {
         info!("[Session:{}] 차단된 도메인 감지: {}", self.session_id(), host);
         
         // 클라이언트 IP 주소 가져오기
@@ -350,7 +347,7 @@ impl Session {
     }
     
     /// HTTP 요청 처리
-    async fn handle_http_request(&self, mut client_stream: TcpStream, host: &str, port: u16, request_str: &str, n: usize, buffer: BytesMut) -> Result<(), Box<dyn Error + Send + Sync>> {
+    async fn handle_http_request(&self, mut client_stream: TcpStream, host: &str, port: u16, request_str: &str, n: usize, buffer: BytesMut) -> Result<()> {
         // 세션 ID는 더 이상 지역 변수로 저장하지 않고 항상 self.session_id()를 직접 호출
         info!("[Session:{}] Processing HTTP request for {}", self.session_id(), host);
         
@@ -437,7 +434,7 @@ impl Session {
     }
     
     /// HTTPS 요청 처리
-    async fn handle_https_request(&self, mut client_stream: TcpStream, host: &str, port: u16, buffer: BytesMut) -> Result<(), Box<dyn Error + Send + Sync>> {
+    async fn handle_https_request(&self, mut client_stream: TcpStream, host: &str, port: u16, buffer: BytesMut) -> Result<()> {
         // 도메인 차단 여부 확인
         if self.domain_blocker.is_blocked(host) {
             info!("[Session:{}] 차단된 도메인 감지: {}", self.session_id(), host);
@@ -616,7 +613,7 @@ impl Session {
     }
 
     // tcp 최적화
-    fn optimize_tcp(&self, stream: &TcpStream) -> Result<(), Box<dyn Error + Send + Sync>> {
+    fn optimize_tcp(&self, stream: &TcpStream) -> Result<()> {
         stream.set_nodelay(TCP_NODELAY)?;
 
         let fd = stream.as_raw_fd();

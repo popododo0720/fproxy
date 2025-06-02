@@ -1,9 +1,9 @@
-use std::error::Error;
 use std::sync::Arc;
 use std::io;
 use std::time::Instant;
 use std::collections::HashMap;
 use std::sync::RwLock;
+use std::error::Error;
 
 use log::{debug, error, info, warn};
 use tokio::net::TcpStream;
@@ -19,6 +19,7 @@ use crate::metrics::Metrics;
 use crate::constants;
 use crate::config::Config;
 use crate::logging::{Logger, LogFormatter};
+use crate::error::{ProxyError, Result, tls_err, internal_err};
 
 // 패턴 상수 정의 - 전역으로 이동하여 매번 생성하지 않도록 함
 const HEADER_END_PATTERN: &[u8] = b"\r\n\r\n";
@@ -130,7 +131,7 @@ pub async fn proxy_tls_streams(
     request_start_time: Instant,
     logger: Option<Arc<Logger>>,
     config: Option<Arc<Config>>,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+) -> Result<()> {
     // 클라이언트 IP 주소 가져오기 (스트림 분할 전에)
     let client_ip = client_stream.get_ref().0.peer_addr()
         .map(|addr| addr.ip().to_string())
@@ -310,7 +311,7 @@ pub async fn proxy_tls_streams(
             // 서버 쓰기 스트림 종료
             let _ = server_write.shutdown().await;
             
-            Ok::<_, Box<dyn Error + Send + Sync>>(())
+            Ok(())
         }
     };
     
@@ -459,7 +460,7 @@ pub async fn proxy_tls_streams(
             // 클라이언트 쓰기 스트림 종료
             let _ = client_write.shutdown().await;
             
-            Ok::<_, Box<dyn Error + Send + Sync>>(())
+            Ok(())
         }
     };
     

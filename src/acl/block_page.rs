@@ -1,4 +1,3 @@
-use std::error::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use log::{debug, error, info};
@@ -7,6 +6,7 @@ use std::sync::Arc;
 
 use crate::tls::{generate_fake_cert, accept_tls_with_cert};
 use crate::logging::Logger;
+use crate::error::{ProxyError, Result, http_err, tls_err};
 
 /// 차단 페이지 생성 및 전송을 담당하는 구조체
 pub struct BlockPage {
@@ -134,7 +134,7 @@ impl BlockPage {
     }
     
     /// HTTP 차단 페이지 전송
-    pub async fn send_http_block_page(&self, client_stream: &mut TcpStream, host: &str, session_id: &str, request: Option<&str>, client_ip: Option<&str>) -> Result<(), Box<dyn Error + Send + Sync>> {
+    pub async fn send_http_block_page(&self, client_stream: &mut TcpStream, host: &str, session_id: &str, request: Option<&str>, client_ip: Option<&str>) -> Result<()> {
         // 요청 로깅
         if let (Some(req), Some(ip)) = (request, client_ip) {
             self.log_blocked_request(req, host, ip, session_id, false).await; // HTTP는 TLS 아님
@@ -158,13 +158,13 @@ impl BlockPage {
             },
             Err(e) => {
                 error!("[Session:{}] Failed to send HTTP block page: {}", session_id, e);
-                Err(e.into())
+                Err(ProxyError::Http(format!("Failed to send HTTP block page: {}", e)))
             }
         }
     }
     
     /// HTTPS 차단 페이지 전송 (CONNECT 요청 처리 포함)
-    pub async fn handle_https_block(&self, mut client_stream: TcpStream, host: &str, session_id: &str, request: Option<&str>, client_ip: Option<&str>) -> Result<(), Box<dyn Error + Send + Sync>> {
+    pub async fn handle_https_block(&self, mut client_stream: TcpStream, host: &str, session_id: &str, request: Option<&str>, client_ip: Option<&str>) -> Result<()> {
         // 요청 로깅
         if let (Some(req), Some(ip)) = (request, client_ip) {
             self.log_blocked_request(req, host, ip, session_id, true).await; // HTTPS는 TLS임
@@ -176,7 +176,7 @@ impl BlockPage {
             Ok(_) => debug!("[Session:{}] Successfully sent CONNECT response", session_id),
             Err(e) => {
                 error!("[Session:{}] Failed to send CONNECT response: {}", session_id, e);
-                return Err(e.into());
+                return Err(ProxyError::Http(format!("Failed to send CONNECT response: {}", e)));
             }
         }
         
@@ -187,7 +187,7 @@ impl BlockPage {
             Ok(cert) => cert,
             Err(e) => {
                 error!("[Session:{}] Failed to generate fake certificate: {}", session_id, e);
-                return Err(e);
+                return Err(ProxyError::Tls(format!("Failed to generate fake certificate: {}", e)));
             }
         };
         
@@ -195,7 +195,7 @@ impl BlockPage {
             Ok(stream) => stream,
             Err(e) => {
                 error!("[Session:{}] Failed to establish TLS with client: {}", session_id, e);
-                return Err(e);
+                return Err(ProxyError::Tls(format!("Failed to establish TLS with client: {}", e)));
             }
         };
         
@@ -220,7 +220,7 @@ impl BlockPage {
             },
             Err(e) => {
                 error!("[Session:{}] Failed to send TLS block page: {}", session_id, e);
-                Err(e.into())
+                Err(ProxyError::Tls(format!("Failed to send TLS block page: {}", e)))
             }
         }
     }

@@ -1,5 +1,4 @@
 use std::sync::{Arc};
-use std::error::Error;
 use log::{error, info};
 
 use tokio::net::TcpListener;
@@ -12,6 +11,7 @@ use crate::buffer::BufferPool;
 use crate::session::Session;
 use crate::logging::Logger;
 use crate::acl::domain_blocker::DomainBlocker;
+use crate::error::{ProxyError, Result, internal_err};
 
 pub struct ProxyServer {
     config: Arc<Config>,
@@ -32,7 +32,7 @@ impl ProxyServer {
         }
     }
 
-    pub async fn run(&self) -> Result<(), Box<dyn Error>> {
+    pub async fn run(&self) -> Result<()> {
         let addr = format!("{}:{}", self.config.bind_host, self.config.bind_port);
         let listener = TcpListener::bind(&addr).await?;
 

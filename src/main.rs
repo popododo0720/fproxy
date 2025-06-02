@@ -1,4 +1,3 @@
-use std::error::Error;
 use std::path::Path;
 use std::sync::Arc;
 use std::io::Write;
@@ -18,6 +17,9 @@ mod proxy;
 mod acl;
 mod db;
 mod logging;
+mod error;
+
+use error::{ProxyError, Result, config_err, db_err, internal_err};
 
 use config::Config;
 use metrics::Metrics;
@@ -39,7 +41,7 @@ static FD_LIMIT: Lazy<u64> = Lazy::new(|| {
 });
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<()> {
     // 로거 초기화
     setup_logger();
     
@@ -158,7 +160,7 @@ fn setup_resource_limits() {
 }
 
 /// 프록시 설정 로드
-fn load_config() -> Result<Config, Box<dyn Error>> {
+fn load_config() -> Result<Config> {
     // 먼저 현재 디렉토리의 config.yml 파일 확인
     if Path::new("config.yml").exists() {
         info!("설정 파일 로드: config.yml");
@@ -169,7 +171,7 @@ fn load_config() -> Result<Config, Box<dyn Error>> {
     match std::env::var("CONFIG_FILE") {
         Ok(path) => {
             info!("환경 변수에서 설정 파일 로드: {}", path);
-            Ok(Config::from_file(&path)?)
+            Ok(Config::from_file(&path).map_err(|e| config_err(e))?)
         },
         Err(_) => {
             info!("설정 파일을 찾을 수 없어 기본 설정 사용");
@@ -179,14 +181,14 @@ fn load_config() -> Result<Config, Box<dyn Error>> {
 }
 
 /// 데이터베이스 설정 및 초기화
-async fn setup_database() -> Result<(), Box<dyn Error>> {
+async fn setup_database() -> Result<()> {
     // DB 설정 로드
     let db_config_path = std::env::var("DB_CONFIG_FILE").unwrap_or_else(|_| "db.yml".to_string());
     if Path::new(&db_config_path).exists() {
         info!("데이터베이스 설정 로드: {}", db_config_path);
         if let Err(e) = DbConfig::initialize(&db_config_path) {
             error!("데이터베이스 설정 로드 실패: {}", e);
-            return Err(e);
+            return Err(db_err(e));
         }
     } else {
         info!("기본 데이터베이스 설정 사용");
@@ -196,6 +198,7 @@ async fn setup_database() -> Result<(), Box<dyn Error>> {
     if let Err(e) = db::pool::initialize_pool().await {
         error!("데이터베이스 연결 풀 초기화 실패: {}", e);
         warn!("데이터베이스 연결 없이 계속 진행합니다. 로그가 저장되지 않을 수 있습니다.");
+        // 이 경우는 에러가 아닌 정상 처리로 간주
         return Ok(());
     }
     
@@ -215,7 +218,7 @@ fn create_buffer_pool() -> BufferPool {
 }
 
 /// 로깅 시스템 초기화
-async fn initialize_logger() -> Result<(), Box<dyn Error>> {
+async fn initialize_logger() -> Result<()> {
     info!("로깅 시스템 초기화 중...");
     
     // 이 함수는 더 이상 사용하지 않지만 호환성을 위해 유지
@@ -225,7 +228,7 @@ async fn initialize_logger() -> Result<(), Box<dyn Error>> {
 }
 
 /// 데이터베이스 초기화
-async fn initialize_database() -> Result<(), Box<dyn Error>> {
+async fn initialize_database() -> Result<()> {
     // 파티션 관리 확인
     debug!("데이터베이스 파티션 확인 중...");
     match db::ensure_partitions().await {
@@ -240,7 +243,7 @@ async fn initialize_database() -> Result<(), Box<dyn Error>> {
 }
 
 /// SSL 디렉토리 확인 및 생성
-fn ensure_ssl_directories(config: &Config) -> Result<(), Box<dyn Error>> {
+fn ensure_ssl_directories(config: &Config) -> Result<()> {
     let ssl_dir = &config.ssl_dir;
     let cert_dir = format!("{}/certs", ssl_dir);
     let key_dir = format!("{}/private", ssl_dir);
@@ -248,7 +251,7 @@ fn ensure_ssl_directories(config: &Config) -> Result<(), Box<dyn Error>> {
     
     for dir in &[ssl_dir, &cert_dir, &key_dir, &trusted_dir] {
         if !Path::new(dir).exists() {
-            std::fs::create_dir_all(dir)?;
+            std::fs::create_dir_all(dir).map_err(|e| ProxyError::from(e))?;
             info!("디렉토리 생성: {}", dir);
         }
     }
