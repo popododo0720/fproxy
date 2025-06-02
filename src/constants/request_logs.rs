@@ -13,11 +13,26 @@ pub const CREATE_TABLE: &str = "
         session_id TEXT NOT NULL,
         client_ip TEXT NOT NULL,
         target_ip TEXT NOT NULL,
-        response_time BIGINT,
         is_rejected BOOLEAN NOT NULL DEFAULT FALSE,
         is_tls BOOLEAN NOT NULL DEFAULT FALSE,
         PRIMARY KEY (id, timestamp)
     ) PARTITION BY RANGE (timestamp)";
+
+/// 로그 삽입 쿼리
+pub const INSERT_LOG: &str = "
+    INSERT INTO request_logs (
+        host, method, path, header, body, timestamp, 
+        session_id, client_ip, target_ip, is_rejected, is_tls
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+";
+
+/// 복사 모드를 위한 쿼리
+pub const COPY_LOGS: &str = "
+    COPY request_logs (
+        host, method, path, header, body, timestamp, 
+        session_id, client_ip, target_ip, is_rejected, is_tls
+    ) FROM STDIN BINARY
+";
 
 /// 기본 인덱스 생성 쿼리 - 부모 테이블에만 적용
 pub const CREATE_INDICES: [&str; 4] = [

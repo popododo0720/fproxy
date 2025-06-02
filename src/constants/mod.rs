@@ -5,6 +5,7 @@ pub mod proxy_stats_hourly;
 pub mod partition;
 pub mod domain_blocks;
 pub mod domain_pattern_blocks;
+pub mod response_logs;
 
 // 버퍼 크기
 pub const BUFFER_SIZE_SMALL: usize = 64 * 1024;   // 64KB
@@ -12,9 +13,9 @@ pub const BUFFER_SIZE_MEDIUM: usize = 256 * 1024;    // 256KB
 pub const BUFFER_SIZE_LARGE: usize = 1024 * 1024;    // 1MB
 
 // 버퍼 풀 크기
-pub const SMALL_POOL_SIZE: usize = 2000;
-pub const MEDIUM_POOL_SIZE: usize = 1000;
-pub const LARGE_POOL_SIZE: usize = 200;
+pub const SMALL_POOL_SIZE: usize = 1000;
+pub const MEDIUM_POOL_SIZE: usize = 500;
+pub const LARGE_POOL_SIZE: usize = 100;
 
 // 적응형 버퍼링 시스템 설정
 pub const BUFFER_ADJUSTMENT_INTERVAL_SECS: u64 = 30;  // 버퍼 크기 조정 간격
@@ -38,6 +39,19 @@ pub const CA_KEY_FILE: &str = "ssl/ca_key.pem";
 pub const CA_CERT_CRT_FILE: &str = "ssl/ca_cert.crt";
 
 // 로그 배치 크기 및 플러시 간격
-pub const LOG_BATCH_SIZE: usize = 1000;
-pub const LOG_FLUSH_INTERVAL_MS: u64 = 200; // 0.2초마다 로그 플러시
+pub const LOG_BATCH_SIZE: usize = 500;
+pub const LOG_FLUSH_INTERVAL_MS: u64 = 1000;
 pub const LOG_CHANNEL_SIZE: usize = 10000;    // 로그 채널 크기
+
+// 워커 풀 설정
+pub const LOG_WORKER_COUNT: usize = 16;  // 로그 워커 스레드 수 (기존 8에서 증가)
+pub const LOG_HIGH_PRIORITY_QUEUE_SIZE: usize = 8000;  // 고우선순위 로그 큐 크기
+pub const LOG_MEDIUM_PRIORITY_QUEUE_SIZE: usize = 12000;  // 중간우선순위 로그 큐 크기
+pub const LOG_LOW_PRIORITY_QUEUE_SIZE: usize = 15000;  // 저우선순위 로그 큐 크기
+
+// 로그 처리 타임아웃 (ms)
+pub const LOG_PROCESSING_TIMEOUT_MS: u64 = 1000;  // 로그 처리 타임아웃
+pub const LOG_DB_OPERATION_TIMEOUT_MS: u64 = 2000;  // DB 작업 타임아웃
+
+// 로그 파티션 관리
+pub const LOG_PARTITION_CHECK_INTERVAL_HOURS: u64 = 24;  // 파티션 체크 주기 (시간)
