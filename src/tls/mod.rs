@@ -1,4 +1,3 @@
-use std::error::Error;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::fs;
@@ -20,6 +19,7 @@ use rustls_pemfile;
 
 use crate::constants::*;
 use crate::config::Config;
+use crate::error::{ProxyError, Result, tls_err, internal_err};
 
 // 루트 CA 인증서와 키를 저장하는 전역 변수
 static ROOT_CA: Lazy<Mutex<Option<Certificate>>> = Lazy::new(|| Mutex::new(None));
@@ -39,7 +39,7 @@ static CLIENT_TLS_CONFIGS: Lazy<RwLock<HashMap<ConfigKey, Arc<ClientConfig>>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
 /// 루트 CA 인증서를 초기화합니다
-pub fn init_root_ca() -> Result<(), Box<dyn Error + Send + Sync>> {
+pub fn init_root_ca() -> Result<()> {
     let mut ca_guard = ROOT_CA.lock().unwrap();
     
     // 기존 CA 인증서가 있는지 확인
@@ -99,7 +99,7 @@ pub fn init_root_ca() -> Result<(), Box<dyn Error + Send + Sync>> {
 }
 
 /// 호스트명을 기반으로 가짜 인증서를 생성합니다
-pub async fn generate_fake_cert(host: &str) -> Result<CertKeyPair, Box<dyn Error + Send + Sync>> {
+pub async fn generate_fake_cert(host: &str) -> Result<CertKeyPair> {
     // 캐시에서 인증서 확인
     {
         let mut cache = CERT_CACHE.write().unwrap();
@@ -127,7 +127,7 @@ pub async fn generate_fake_cert(host: &str) -> Result<CertKeyPair, Box<dyn Error
                         let key_data = key.secret_pkcs1_der().to_vec();
                         PrivateKeyDer::Pkcs1(key_data.into())
                     },
-                    _ => return Err("Unsupported private key format".into()),
+                    _ => return Err(internal_err("Unsupported private key format")),
                 };
                 
                 return Ok((cert_chain, private_key));
@@ -146,7 +146,7 @@ pub async fn generate_fake_cert(host: &str) -> Result<CertKeyPair, Box<dyn Error
     let ca_cert = ca_guard.as_ref().ok_or_else(|| {
         let err = "Root CA not initialized";
         error!("{}", err);
-        std::io::Error::new(std::io::ErrorKind::Other, err)
+        internal_err(err)
     })?;
     
     // 도메인 인증서 매개변수 설정
@@ -175,13 +175,13 @@ pub async fn generate_fake_cert(host: &str) -> Result<CertKeyPair, Box<dyn Error
     // 인증서 생성
     let cert = Certificate::from_params(params).map_err(|e| {
         error!("Failed to generate certificate: {}", e);
-        e
+        tls_err(e)
     })?;
     
     // CA로 서명
     let cert_der = cert.serialize_der_with_signer(ca_cert).map_err(|e| {
         error!("Failed to sign certificate with CA: {}", e);
-        e
+        tls_err(e)
     })?;
     
     let key_der = cert.serialize_private_key_der();
@@ -189,7 +189,7 @@ pub async fn generate_fake_cert(host: &str) -> Result<CertKeyPair, Box<dyn Error
     // 인증서 체인 구성 (도메인 인증서 + CA 인증서)
     let ca_cert_der = ca_cert.serialize_der().map_err(|e| {
         error!("Failed to serialize CA certificate: {}", e);
-        e
+        tls_err(e)
     })?;
     
     let cert_chain = vec![
@@ -213,7 +213,7 @@ pub async fn generate_fake_cert(host: &str) -> Result<CertKeyPair, Box<dyn Error
             let key_data = key.secret_pkcs1_der().to_vec();
             PrivateKeyDer::Pkcs1(key_data.into())
         },
-        _ => return Err("Unsupported private key format".into()),
+        _ => return Err(internal_err("Unsupported private key format")),
     };
     
     let cert_key_pair = (cert_chain.clone(), private_key_for_cache);
@@ -226,10 +226,7 @@ pub async fn generate_fake_cert(host: &str) -> Result<CertKeyPair, Box<dyn Error
 }
 
 /// 클라이언트와 TLS 연결을 수립합니다 - 세션 재사용 지원
-pub async fn accept_tls_with_cert(
-    tcp_stream: TcpStream,
-    cert_key_pair: CertKeyPair
-) -> Result<ServerTlsStream<TcpStream>, Box<dyn Error + Send + Sync>> {
+pub async fn accept_tls_with_cert(tcp_stream: TcpStream, cert_key_pair: CertKeyPair) -> Result<ServerTlsStream<TcpStream>> {
     let (certs, key) = cert_key_pair;
     
     // 서버 설정 구성 - 세션 재사용 지원
@@ -254,7 +251,7 @@ pub async fn accept_tls_with_cert(
 }
 
 /// 실제 서버와 TLS 연결을 수립합니다 - 세션 재사용 개선
-pub async fn connect_tls(host: &str, config: &Config) -> Result<ClientTlsStream<TcpStream>, Box<dyn Error + Send + Sync>> {
+pub async fn connect_tls(host: &str, config: &Config) -> Result<ClientTlsStream<TcpStream>> {
     // 포트 번호가 포함된 경우 분리
     let (host_only, port) = if let Some(idx) = host.rfind(':') {
         let (h, p) = host.split_at(idx);
@@ -342,7 +339,7 @@ pub async fn connect_tls(host: &str, config: &Config) -> Result<ClientTlsStream<
 }
 
 /// TCP 소켓 최적화 설정을 적용합니다
-fn set_tcp_socket_options(stream: &TcpStream) -> Result<(), std::io::Error> {
+fn set_tcp_socket_options(stream: &TcpStream) -> std::result::Result<(), std::io::Error> {
     use std::os::unix::io::AsRawFd;
     
     let fd = stream.as_raw_fd();
@@ -375,7 +372,7 @@ fn set_tcp_socket_options(stream: &TcpStream) -> Result<(), std::io::Error> {
 }
 
 // 인증서 검증이 활성화된 클라이언트 설정 생성
-fn create_verified_client_config(config: &Config) -> Result<ClientConfig, Box<dyn Error + Send + Sync>> {
+fn create_verified_client_config(config: &Config) -> Result<ClientConfig> {
     debug!("TLS certificate verification enabled - using system root certificates");
     
     // 시스템의 루트 인증서 로드
@@ -434,7 +431,7 @@ fn create_verified_client_config(config: &Config) -> Result<ClientConfig, Box<dy
 }
 
 // 인증서 검증이 비활성화된 클라이언트 설정 생성
-fn create_unverified_client_config() -> Result<ClientConfig, Box<dyn Error + Send + Sync>> {
+fn create_unverified_client_config() -> Result<ClientConfig> {
     // 인증서 검증 비활성화
     warn!("TLS certificate verification COMPLETELY DISABLED! All certificates will be trusted.");
     info!("인증서 검증 비활성화 모드로 TLS 설정 생성 중...");
@@ -459,7 +456,7 @@ fn create_unverified_client_config() -> Result<ClientConfig, Box<dyn Error + Sen
             server_name: &ServerName<'_>,
             _ocsp: &[u8],
             _now: UnixTime,
-        ) -> Result<ServerCertVerified, rustls::Error> {
+        ) -> std::result::Result<ServerCertVerified, rustls::Error> {
             // 무조건 통과
             info!("인증서 검증 비활성화: 서버 {:?} 인증서 검증 없이 통과 처리됨", server_name);
             Ok(ServerCertVerified::assertion())
@@ -470,7 +467,7 @@ fn create_unverified_client_config() -> Result<ClientConfig, Box<dyn Error + Sen
             _message: &[u8],
             _cert: &CertificateDer<'_>,
             _dss: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
             // 무조건 통과
             Ok(HandshakeSignatureValid::assertion())
         }
@@ -480,7 +477,7 @@ fn create_unverified_client_config() -> Result<ClientConfig, Box<dyn Error + Sen
             _message: &[u8],
             _cert: &CertificateDer<'_>,
             _dss: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
             // 무조건 통과
             Ok(HandshakeSignatureValid::assertion())
         }
@@ -520,7 +517,7 @@ fn create_unverified_client_config() -> Result<ClientConfig, Box<dyn Error + Sen
 }
 
 /// ssl/trusted_certs 폴더에서 인증서를 자동으로 로드합니다.
-pub fn load_trusted_certificates(config: &mut Config) -> Result<(), Box<dyn Error + Send + Sync>> {
+pub fn load_trusted_certificates(config: &mut Config) -> Result<()> {
     let trusted_certs_dir = format!("{}/trusted_certs", config.ssl_dir);
     let trusted_certs_path = Path::new(&trusted_certs_dir);
     

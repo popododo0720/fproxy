@@ -1,11 +1,11 @@
 use std::sync::RwLock;
 use std::time::{Instant, Duration};
 use std::sync::Arc;
-use std::thread;
 
 use bytes::{BytesMut};
 use log::{info, debug, warn};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
+use tokio::task;
 use rayon::prelude::*;
 
 use crate::constants::*;
@@ -177,10 +177,10 @@ impl BufferPool {
             adjustment_tx: tx,
         };
         
-        // 적응형 버퍼 풀 조정 스레드 시작
+        // 적응형 버퍼 풀 조정 태스크 시작 (tokio 비동기 태스크 사용)
         let pool_clone = Arc::new(pool.clone());
-        thread::spawn(move || {
-            Self::adjustment_loop(pool_clone, rx);
+        task::spawn(async move {
+            Self::adjustment_loop(pool_clone, rx).await;
         });
         
         info!("버퍼 풀 초기화 완료 - 소형: {}, 중형: {}, 대형: {}", small_capacity, medium_capacity, large_capacity);
@@ -188,46 +188,60 @@ impl BufferPool {
     }
     
     /// 버퍼 풀 조정 루프
-    fn adjustment_loop(pool: Arc<BufferPool>, mut rx: mpsc::Receiver<BufferPoolCommand>) {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+    async fn adjustment_loop(pool: Arc<BufferPool>, mut rx: mpsc::Receiver<BufferPoolCommand>) {
+        loop {
+            // 일정 시간마다 조정 명령 전송
+            tokio::time::sleep(Duration::from_secs(BUFFER_ADJUSTMENT_INTERVAL_SECS)).await;
             
-        runtime.block_on(async {
-            loop {
-                // 일정 시간마다 조정 명령 전송
-                tokio::time::sleep(Duration::from_secs(BUFFER_ADJUSTMENT_INTERVAL_SECS)).await;
-                
-                // 조정 명령 전송
-                match pool.adjustment_tx.send(BufferPoolCommand::Adjust).await {
-                    Ok(_) => {},
-                    Err(e) => {
-                        warn!("버퍼 풀 조정 명령 전송 실패: {}", e);
-                        break;
-                    }
-                }
-                
-                // 명령 수신 및 처리
-                match rx.recv().await {
-                    Some(BufferPoolCommand::Adjust) => {
-                        pool.adjust_buffer_pools();
-                    },
-                    Some(BufferPoolCommand::Shutdown) => {
-                        info!("버퍼 풀 조정 스레드 종료");
-                        break;
-                    },
-                    None => {
-                        warn!("버퍼 풀 조정 채널이 닫힘");
-                        break;
-                    }
+            // 조정 명령 전송
+            match pool.adjustment_tx.send(BufferPoolCommand::Adjust).await {
+                Ok(_) => {},
+                Err(e) => {
+                    warn!("버퍼 풀 조정 명령 전송 실패: {}", e);
+                    break;
                 }
             }
-        });
+            
+            // 명령 수신 및 처리
+            match rx.recv().await {
+                Some(BufferPoolCommand::Adjust) => {
+                    // 비동기 컨텍스트에서 버퍼 풀 조정 실행
+                    // Arc를 복사하여 전달
+                    Self::adjust_buffer_pools_async(Arc::clone(&pool)).await;
+                },
+                Some(BufferPoolCommand::Shutdown) => {
+                    info!("버퍼 풀 조정 태스크 종료");
+                    break;
+                },
+                None => {
+                    warn!("버퍼 풀 조정 채널이 닫힘");
+                    break;
+                }
+            }
+        }
     }
     
-    /// 버퍼 풀 크기 조정
+    /// 버퍼 풀 크기 조정 (비동기 버전)
+    async fn adjust_buffer_pools_async(pool: Arc<BufferPool>) {
+        // 비동기 컨텍스트에서 안전하게 락 확보
+        // Arc를 복사하여 소유권 문제 해결
+        let adjust_result = tokio::task::spawn_blocking(move || {
+            pool.adjust_buffer_pools_internal()
+        }).await;
+        
+        if let Err(e) = adjust_result {
+            warn!("버퍼 풀 조정 태스크 실패: {}", e);
+        }
+    }
+    
+    /// 버퍼 풀 크기 조정 (동기 버전 - 이전 코드와의 호환성 유지)
     fn adjust_buffer_pools(&self) {
+        // 동기 컨텍스트에서 호출되는 경우를 위한 래퍼
+        self.adjust_buffer_pools_internal();
+    }
+    
+    /// 버퍼 풀 크기 조정 내부 구현
+    fn adjust_buffer_pools_internal(&self) {
         let mut stats = self.stats.write().unwrap();
         
         // 조정 시간 확인
@@ -235,63 +249,70 @@ impl BufferPool {
             return;
         }
         
-        // 현재 사용 가능한 버퍼 수 확인
+        stats.update_adjustment_time();
+        
+        // 현재 풀 사용률 계산
         let small_available = self.small_buffers.read().unwrap().len();
         let medium_available = self.medium_buffers.read().unwrap().len();
         let large_available = self.large_buffers.read().unwrap().len();
         
-        // 사용률 계산
         stats.update_usage_rates(small_available, medium_available, large_available);
         
-        // 풀 크기 조정
-        let mut small_size = stats.small_pool_size;
-        let mut medium_size = stats.medium_pool_size;
-        let mut large_size = stats.large_pool_size;
+        // 사용률에 따른 풀 크기 조정
+        let small_pool_size = stats.small_pool_size;
+        let medium_pool_size = stats.medium_pool_size;
+        let large_pool_size = stats.large_pool_size;
         
-        // 사용률에 따라 풀 크기 조정
-        if stats.small_usage_rate > BUFFER_USAGE_THRESHOLD_HIGH {
+        // 소형 버퍼 풀 조정
+        let new_small_size = if stats.small_usage_rate > BUFFER_USAGE_THRESHOLD_HIGH {
             // 사용률이 높으면 풀 크기 증가
-            let increase = (small_size as f64 * BUFFER_POOL_ADJUSTMENT_RATE) as usize;
-            small_size += increase;
-            debug!("소형 버퍼 풀 확장: {} -> {} (사용률: {:.1}%)", 
-                  stats.small_pool_size, small_size, stats.small_usage_rate * 100.0);
+            ((small_pool_size as f64) * (1.0 + BUFFER_POOL_ADJUSTMENT_RATE)) as usize
         } else if stats.small_usage_rate < BUFFER_USAGE_THRESHOLD_LOW {
-            // 사용률이 낮으면 풀 크기 감소 (최소 SMALL_POOL_SIZE/2 유지)
-            let decrease = (small_size as f64 * BUFFER_POOL_ADJUSTMENT_RATE) as usize;
-            small_size = std::cmp::max(small_size.saturating_sub(decrease), SMALL_POOL_SIZE / 2);
-            debug!("소형 버퍼 풀 축소: {} -> {} (사용률: {:.1}%)", 
-                  stats.small_pool_size, small_size, stats.small_usage_rate * 100.0);
-        }
+            // 사용률이 낮으면 풀 크기 감소
+            ((small_pool_size as f64) * (1.0 - BUFFER_POOL_ADJUSTMENT_RATE)) as usize
+        } else {
+            small_pool_size
+        };
         
-        if stats.medium_usage_rate > BUFFER_USAGE_THRESHOLD_HIGH {
-            let increase = (medium_size as f64 * BUFFER_POOL_ADJUSTMENT_RATE) as usize;
-            medium_size += increase;
-            debug!("중형 버퍼 풀 확장: {} -> {} (사용률: {:.1}%)", 
-                  stats.medium_pool_size, medium_size, stats.medium_usage_rate * 100.0);
+        // 중형 버퍼 풀 조정
+        let new_medium_size = if stats.medium_usage_rate > BUFFER_USAGE_THRESHOLD_HIGH {
+            ((medium_pool_size as f64) * (1.0 + BUFFER_POOL_ADJUSTMENT_RATE)) as usize
         } else if stats.medium_usage_rate < BUFFER_USAGE_THRESHOLD_LOW {
-            let decrease = (medium_size as f64 * BUFFER_POOL_ADJUSTMENT_RATE) as usize;
-            medium_size = std::cmp::max(medium_size.saturating_sub(decrease), MEDIUM_POOL_SIZE / 2);
-            debug!("중형 버퍼 풀 축소: {} -> {} (사용률: {:.1}%)", 
-                  stats.medium_pool_size, medium_size, stats.medium_usage_rate * 100.0);
-        }
+            ((medium_pool_size as f64) * (1.0 - BUFFER_POOL_ADJUSTMENT_RATE)) as usize
+        } else {
+            medium_pool_size
+        };
         
-        if stats.large_usage_rate > BUFFER_USAGE_THRESHOLD_HIGH {
-            let increase = (large_size as f64 * BUFFER_POOL_ADJUSTMENT_RATE) as usize;
-            large_size += increase;
-            debug!("대형 버퍼 풀 확장: {} -> {} (사용률: {:.1}%)", 
-                  stats.large_pool_size, large_size, stats.large_usage_rate * 100.0);
+        // 대형 버퍼 풀 조정
+        let new_large_size = if stats.large_usage_rate > BUFFER_USAGE_THRESHOLD_HIGH {
+            ((large_pool_size as f64) * (1.0 + BUFFER_POOL_ADJUSTMENT_RATE)) as usize
         } else if stats.large_usage_rate < BUFFER_USAGE_THRESHOLD_LOW {
-            let decrease = (large_size as f64 * BUFFER_POOL_ADJUSTMENT_RATE) as usize;
-            large_size = std::cmp::max(large_size.saturating_sub(decrease), LARGE_POOL_SIZE / 2);
-            debug!("대형 버퍼 풀 축소: {} -> {} (사용률: {:.1}%)", 
-                  stats.large_pool_size, large_size, stats.large_usage_rate * 100.0);
+            ((large_pool_size as f64) * (1.0 - BUFFER_POOL_ADJUSTMENT_RATE)) as usize
+        } else {
+            large_pool_size
+        };
+        
+        // 최소 크기 보장 (SMALL_POOL_SIZE, MEDIUM_POOL_SIZE, LARGE_POOL_SIZE의 절반 값 사용)
+        let new_small_size = new_small_size.max(SMALL_POOL_SIZE / 2);
+        let new_medium_size = new_medium_size.max(MEDIUM_POOL_SIZE / 2);
+        let new_large_size = new_large_size.max(LARGE_POOL_SIZE / 2);
+        
+        // 크기 변경이 있을 경우에만 조정
+        if new_small_size != small_pool_size || 
+           new_medium_size != medium_pool_size || 
+           new_large_size != large_pool_size {
+            
+            info!("버퍼 풀 크기 조정 - 소형: {} -> {}, 중형: {} -> {}, 대형: {} -> {}",
+                small_pool_size, new_small_size,
+                medium_pool_size, new_medium_size,
+                large_pool_size, new_large_size);
+            
+            // 풀 크기 업데이트
+            stats.update_pool_sizes(new_small_size, new_medium_size, new_large_size);
+            
+            // 버퍼 풀 재할당
+            self.resize_pools(new_small_size, new_medium_size, new_large_size);
         }
-        
-        // 풀 크기 조정 실행
-        self.resize_pools(small_size, medium_size, large_size);
-        
-        // 통계 업데이트
-        stats.update_pool_sizes(small_size, medium_size, large_size);
         stats.update_adjustment_time();
         stats.print_metrics();
     }
@@ -462,6 +483,10 @@ impl Clone for BufferPool {
 impl Drop for BufferPool {
     fn drop(&mut self) {
         // 마지막 인스턴스가 제거될 때 종료 명령 전송
-        let _ = self.adjustment_tx.try_send(BufferPoolCommand::Shutdown);
+        // 비동기 종료를 위해 비동기 채널에 명령 전송
+        // 이미 종료된 경우를 고려하여 try_send 사용
+        if let Err(e) = self.adjustment_tx.try_send(BufferPoolCommand::Shutdown) {
+            debug!("BufferPool 종료 명령 전송 실패 (이미 종료되었을 수 있음): {}", e);
+        }
     }
 }

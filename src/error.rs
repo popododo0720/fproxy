@@ -7,6 +7,7 @@ use tokio::time::error::Elapsed;
 use tokio_rustls::rustls;
 use deadpool_postgres::PoolError;
 use tokio_postgres::Error as PgError;
+use rcgen::Error as RcgenError;
 
 /// UDSS 프록시 서버의 모든 에러 타입을 정의합니다.
 #[derive(Debug)]
@@ -116,6 +117,18 @@ impl<T> From<PoisonError<T>> for ProxyError {
 
 impl From<Box<dyn StdError + Send + Sync>> for ProxyError {
     fn from(err: Box<dyn StdError + Send + Sync>) -> Self {
+        ProxyError::Other(format!("{}", err))
+    }
+}
+
+impl From<RcgenError> for ProxyError {
+    fn from(err: RcgenError) -> Self {
+        ProxyError::Tls(format!("인증서 생성 에러: {}", err))
+    }
+}
+
+impl From<Box<dyn StdError>> for ProxyError {
+    fn from(err: Box<dyn StdError>) -> Self {
         ProxyError::Other(format!("{}", err))
     }
 }
