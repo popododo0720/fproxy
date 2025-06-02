@@ -1,5 +1,4 @@
 target/
 ssl/
-logs/
 perf.*
 flamegraph.svg

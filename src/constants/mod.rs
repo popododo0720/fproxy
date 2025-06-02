@@ -12,6 +12,10 @@ pub const BUFFER_SIZE_SMALL: usize = 64 * 1024;   // 64KB
 pub const BUFFER_SIZE_MEDIUM: usize = 256 * 1024;    // 256KB
 pub const BUFFER_SIZE_LARGE: usize = 1024 * 1024;    // 1MB
 
+// 기본 버퍼 크기와 타임아웃
+pub const DEFAULT_BUFFER_SIZE: usize = BUFFER_SIZE_MEDIUM;    // 256KB
+pub const DEFAULT_PROXY_TIMEOUT_MS: u64 = 30000;    // 30초
+
 // 버퍼 풀 크기
 pub const SMALL_POOL_SIZE: usize = 1000;
 pub const MEDIUM_POOL_SIZE: usize = 500;

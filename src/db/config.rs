@@ -1,4 +1,3 @@
-use std::error::Error;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -7,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use log::{info, error, warn};
 use once_cell::sync::Lazy;
 use std::sync::RwLock;
+
+use crate::error::{Result, db_err};
 
 // 데이터베이스 설정을 전역적으로 관리하는 싱글톤
 pub static DB_CONFIG: Lazy<RwLock<DbConfig>> = Lazy::new(|| {
@@ -83,7 +84,7 @@ impl Default for DbConfig {
 
 impl DbConfig {
     /// 설정 파일에서 DB 설정 로드
-    pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn Error>> {
+    pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
         info!("DB 설정 파일 로드: {}", path.display());
         
@@ -98,7 +99,7 @@ impl DbConfig {
     }
     
     /// 전역 설정 초기화
-    pub fn initialize<P: AsRef<Path>>(path: P) -> Result<(), Box<dyn Error>> {
+    pub fn initialize<P: AsRef<Path>>(path: P) -> Result<()> {
         match Self::load_from_file(path) {
             Ok(config) => {
                 if let Ok(mut global_config) = DB_CONFIG.write() {
@@ -106,7 +107,7 @@ impl DbConfig {
                     Ok(())
                 } else {
                     error!("DB 설정 글로벌 변수 잠금 획득 실패");
-                    Err("DB 설정 글로벌 변수 잠금 획득 실패".into())
+                    Err(db_err("DB 설정 글로벌 변수 잠금 획득 실패"))
                 }
             },
             Err(e) => {
@@ -117,13 +118,12 @@ impl DbConfig {
     }
     
     /// 전역 설정 가져오기
-    pub fn get() -> Result<Self, Box<dyn Error + Send + Sync>> {
+    pub fn get() -> Result<Self> {
         if let Ok(config) = DB_CONFIG.read() {
             Ok(config.clone())
         } else {
             error!("DB 설정 글로벌 변수 읽기 잠금 획득 실패");
-            let err: Box<dyn Error + Send + Sync> = "DB 설정 글로벌 변수 읽기 잠금 획득 실패".into();
-            Err(err)
+            Err(db_err("DB 설정 글로벌 변수 읽기 잠금 획득 실패"))
         }
     }
 

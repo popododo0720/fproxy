@@ -8,6 +8,7 @@ use tokio_rustls::rustls;
 use deadpool_postgres::PoolError;
 use tokio_postgres::Error as PgError;
 use rcgen::Error as RcgenError;
+use serde_yaml::Error as YamlError;
 
 /// UDSS 프록시 서버의 모든 에러 타입을 정의합니다.
 #[derive(Debug)]
@@ -142,6 +143,12 @@ impl From<String> for ProxyError {
 impl From<&str> for ProxyError {
     fn from(err: &str) -> Self {
         ProxyError::Other(err.to_string())
+    }
+}
+
+impl From<YamlError> for ProxyError {
+    fn from(err: YamlError) -> Self {
+        ProxyError::Config(format!("YAML 파싱 에러: {}", err))
     }
 }
 

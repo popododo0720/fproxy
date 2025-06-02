@@ -131,59 +131,7 @@ impl PartitionManager {
         Ok(())
     }
     
-    /// 단일 파티션 생성
-    #[allow(dead_code)]
-    async fn create_partition(
-        &self,
-        client: &Client,
-        table_type: TableType, 
-        date: chrono::NaiveDate
-    ) -> Result<String, Box<dyn Error + Send + Sync>> {
-        let table_name = table_type.get_name();
-        let partition_name = self.get_partition_name(table_name, date);
-        let next_date = date.succ_opt().unwrap_or(date);
-        
-        // 파티션 생성
-        let create_partition_sql = format!(
-            "CREATE TABLE IF NOT EXISTS {} PARTITION OF {} 
-             FOR VALUES FROM ('{}') TO ('{}')",
-            partition_name, table_name,
-            date, next_date
-        );
-        
-        client.execute(&create_partition_sql, &[]).await?;
-        
-        // 테이블별 인덱스 생성
-        match table_type {
-            TableType::RequestLogs => {
-                // request_logs 테이블 전용 인덱스만 생성
-                for index_sql in request_logs::create_partition_indices(&partition_name) {
-                    client.execute(&index_sql, &[]).await?;
-                }
-            },
-            TableType::ResponseLogs => {
-                // response_logs 테이블 전용 인덱스만 생성
-                for index_sql in crate::constants::response_logs::create_partition_indices(&partition_name) {
-                    client.execute(&index_sql, &[]).await?;
-                }
-            },
-            TableType::ProxyStats => {
-                // proxy_stats 테이블 전용 인덱스만 생성
-                for index_sql in proxy_stats::create_partition_indices(&partition_name) {
-                    client.execute(&index_sql, &[]).await?;
-                }
-            },
-            TableType::ProxyStatsHourly => {
-                // proxy_stats_hourly 테이블 전용 인덱스만 생성
-                for index_sql in proxy_stats_hourly::create_partition_indices(&partition_name) {
-                    client.execute(&index_sql, &[]).await?;
-                }
-            }
-        }
-        
-        debug!("파티션 생성 완료: {}", partition_name);
-        Ok(partition_name)
-    }
+
     
     /// 파티션 이름 생성
     fn get_partition_name(&self, table_name: &str, date: chrono::NaiveDate) -> String {
@@ -197,40 +145,6 @@ impl PartitionManager {
             month, 
             day
         )
-    }
-    
-    /// 파티션이 존재하는지 확인
-    #[allow(dead_code)]
-    async fn partition_exists(
-        &self,
-        client: &Client,
-        partition_name: &str
-    ) -> Result<bool, Box<dyn Error + Send + Sync>> {
-        // 테이블 유형 확인
-        let table_type = if partition_name.starts_with("proxy_stats_hourly") {
-            TableType::ProxyStatsHourly
-        } else if partition_name.starts_with("proxy_stats") {
-            TableType::ProxyStats
-        } else if partition_name.starts_with("response_logs") {
-            TableType::ResponseLogs
-        } else {
-            TableType::RequestLogs
-        };
-        
-        // 테이블 유형에 따라 적절한 쿼리 선택
-        let check_query = match table_type {
-            TableType::ProxyStatsHourly => crate::constants::proxy_stats_hourly::CHECK_PARTITION_EXISTS,
-            TableType::ProxyStats => crate::constants::proxy_stats::CHECK_PARTITION_EXISTS,
-            _ => "SELECT EXISTS (SELECT FROM pg_tables WHERE schemaname = 'public' AND tablename = $1)"
-        };
-        
-        match client.query_one(check_query, &[&partition_name]).await {
-            Ok(row) => Ok(row.get::<_, bool>(0)),
-            Err(e) => {
-                error!("파티션 존재 여부 확인 실패: {}", e);
-                Err(e.into())
-            }
-        }
     }
     
     /// 오래된 파티션 삭제
@@ -694,7 +608,7 @@ pub async fn ensure_partitions() -> Result<(), Box<dyn Error + Send + Sync>> {
         },
         Err(e) => {
             error!("DB 설정 로드 실패: {}", e);
-            Err(e)
+            Err(Box::new(e))
         }
     }
 } 

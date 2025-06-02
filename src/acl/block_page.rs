@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::tls::{generate_fake_cert, accept_tls_with_cert};
 use crate::logging::Logger;
-use crate::error::{ProxyError, Result, http_err, tls_err};
+use crate::error::{ProxyError, Result};
 
 /// 차단 페이지 생성 및 전송을 담당하는 구조체
 pub struct BlockPage {

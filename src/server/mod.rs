@@ -11,7 +11,7 @@ use crate::buffer::BufferPool;
 use crate::session::Session;
 use crate::logging::Logger;
 use crate::acl::domain_blocker::DomainBlocker;
-use crate::error::{ProxyError, Result, internal_err};
+use crate::error::{Result};
 
 pub struct ProxyServer {
     config: Arc<Config>,

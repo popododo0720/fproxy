@@ -3,8 +3,6 @@ use std::io;
 use std::time::Instant;
 use std::collections::HashMap;
 use std::sync::RwLock;
-use std::error::Error;
-
 use log::{debug, error, info, warn};
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -19,7 +17,7 @@ use crate::metrics::Metrics;
 use crate::constants;
 use crate::config::Config;
 use crate::logging::{Logger, LogFormatter};
-use crate::error::{ProxyError, Result, tls_err, internal_err};
+use crate::error::{Result, ProxyError};
 
 // 패턴 상수 정의 - 전역으로 이동하여 매번 생성하지 않도록 함
 const HEADER_END_PATTERN: &[u8] = b"\r\n\r\n";
@@ -80,7 +78,16 @@ fn is_response_complete(
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut resp = httparse::Response::new(&mut headers);
     
-    if let Ok(_) = resp.parse(&resp_bytes[..headers_end_pos]) {
+    if let Ok(status) = resp.parse(&resp_bytes[..headers_end_pos]) {
+        // 상태 코드 확인
+        if let Some(status_code) = resp.code {
+            // 특정 상태 코드는 본문이 없을 수 있음 (1xx, 204, 304 등)
+            if (status_code >= 100 && status_code < 200) || status_code == 204 || status_code == 304 {
+                debug!("본문이 없는 상태 코드 감지: {}", status_code);
+                return (true, None, false);
+            }
+        }
+        
         // Content-Length 또는 Transfer-Encoding 찾기
         let mut content_length = None;
         let mut is_chunked = false;
@@ -93,12 +100,16 @@ fn is_response_complete(
             if header.name.eq_ignore_ascii_case("content-length") {
                 if let Ok(len_str) = std::str::from_utf8(header.value) {
                     if let Ok(len) = len_str.trim().parse::<usize>() {
+                        debug!("Content-Length 헤더 감지: {}", len);
                         content_length = Some(len);
                     }
                 }
             } else if header.name.eq_ignore_ascii_case("transfer-encoding") {
                 if let Ok(value) = std::str::from_utf8(header.value) {
                     is_chunked = value.to_lowercase().contains("chunked");
+                    if is_chunked {
+                        debug!("Chunked 인코딩 감지");
+                    }
                 }
             }
         }
@@ -107,15 +118,25 @@ fn is_response_complete(
         if is_chunked {
             // chunked 인코딩의 경우 마지막 청크 패턴 확인
             let is_complete = chunk_searcher.search_in(resp_bytes).is_some();
+            if is_complete {
+                debug!("Chunked 응답 완료 감지");
+            }
             return (is_complete, None, true);
         } else if let Some(len) = content_length {
             // Content-Length가 있는 경우, 헤더 끝 이후의 본문 길이 확인
-            let body_length = resp_bytes.len() - headers_end_pos;
-            return (body_length >= len, Some(len), false);
+            let body_length = resp_bytes.len() - headers_end_pos - 4; // 헤더 끝 패턴(\r\n\r\n) 길이 4 제외
+            let is_complete = body_length >= len;
+            if is_complete {
+                debug!("Content-Length 기반 응답 완료 감지: 본문 길이 {}/{}", body_length, len);
+            }
+            return (is_complete, Some(len), false);
         } else {
             // Content-Length도 없고 chunked도 아닌 경우, 헤더 수신 후 즉시 응답 완료로 처리
+            debug!("Content-Length 없는 응답, 헤더 수신 후 완료로 처리");
             return (true, None, false);
         }
+    } else {
+        debug!("응답 헤더 파싱 실패");
     }
     
     (false, None, false)
@@ -166,7 +187,7 @@ pub async fn proxy_tls_streams(
         let request_times = Arc::clone(&request_times);
         let parsing_request = Arc::clone(&parsing_request);
         let current_request_id = Arc::clone(&current_request_id);
-        let metrics_clone = Arc::clone(&metrics);
+        let metrics_clone: Arc<Metrics> = Arc::clone(&metrics);
         let client_ip = client_ip_clone.clone();
         let server_ip = server_ip_clone.clone();
         let logger_clone = logger.clone();
@@ -179,15 +200,16 @@ pub async fn proxy_tls_streams(
             // config에서 buffer_size 가져오기
             let buffer_size = config_clone.as_ref()
                 .map(|c| c.buffer_size)
-                .unwrap_or(constants::BUFFER_SIZE_MEDIUM);
+                .unwrap_or(constants::DEFAULT_BUFFER_SIZE);
                 
+            debug!("[Session:{}] TLS 클라이언트→서버 버퍼 크기: {}", session_id_str, buffer_size);
             let mut req_buffer = BytesMut::with_capacity(buffer_size);
             
             // 패턴 검색기 초기화 - 각 클로저에서 별도로 생성
             let header_searcher = TwoWaySearcher::new(HEADER_END_PATTERN);
             
-            // 버퍼 재사용을 위한 초기화
-            let mut buffer = BytesMut::with_capacity(constants::BUFFER_SIZE_MEDIUM);
+            // 버퍼 재사용을 위한 초기화 - 설정된 버퍼 크기 사용
+            let mut buffer = BytesMut::with_capacity(buffer_size);
             
             loop {
                 buffer.clear(); // 버퍼 재사용 
@@ -288,18 +310,43 @@ pub async fn proxy_tls_streams(
                         
                         // 서버로 데이터 전송
                         if let Err(e) = server_write.write_all(&buffer).await {
-                            error!("[Session:{}] 서버 쓰기 오류: {}", session_id_str, e);
-                            return Err(e.into());
+                            // 연결 종료 오류는 정상적인 종료로 처리
+                            if e.kind() == io::ErrorKind::BrokenPipe || 
+                               e.kind() == io::ErrorKind::ConnectionReset || 
+                               e.kind() == io::ErrorKind::ConnectionAborted {
+                                debug!("[Session:{}] 서버 연결 종료: {}", session_id_str, e);
+                                break;
+                            } else {
+                                error!("[Session:{}] 서버 쓰기 오류: {}", session_id_str, e);
+                                return Err(crate::error::ProxyError::Io(e));
+                            }
+                        }
+                        
+                        // 버퍼를 플러시하여 데이터가 즉시 전송되도록 함
+                        if let Err(e) = server_write.flush().await {
+                            if e.kind() == io::ErrorKind::BrokenPipe || 
+                               e.kind() == io::ErrorKind::ConnectionReset || 
+                               e.kind() == io::ErrorKind::ConnectionAborted {
+                                debug!("[Session:{}] 서버 플러시 중 연결 종료: {}", session_id_str, e);
+                                break;
+                            } else {
+                                error!("[Session:{}] 서버 플러시 오류: {}", session_id_str, e);
+                                return Err(crate::error::ProxyError::Io(e));
+                            }
                         }
                         
                         total_bytes += n as u64;
                         metrics_clone.add_tls_bytes_in(n as u64);
                     },
                     Err(e) => {
-                        if e.kind() == io::ErrorKind::UnexpectedEof {
-                            debug!("[Session:{}] 클라이언트 연결 종료", session_id_str);
+                        if e.kind() == io::ErrorKind::UnexpectedEof || 
+                           e.kind() == io::ErrorKind::BrokenPipe || 
+                           e.kind() == io::ErrorKind::ConnectionReset || 
+                           e.kind() == io::ErrorKind::ConnectionAborted {
+                            debug!("[Session:{}] 클라이언트 연결 종료: {}", session_id_str, e);
                         } else {
                             error!("[Session:{}] 클라이언트 읽기 오류: {}", session_id_str, e);
+                            metrics_clone.increment_error_count();
                         }
                         break;
                     }
@@ -318,7 +365,7 @@ pub async fn proxy_tls_streams(
     let server_to_client = {
         let request_times = Arc::clone(&request_times);
         let current_request_id = Arc::clone(&current_request_id);
-        let metrics_clone = Arc::clone(&metrics);
+        let metrics_clone: Arc<Metrics> = Arc::clone(&metrics);
         let session_id_str = session_id.to_string();
         let logger_clone = logger.clone();
         let config_clone = config.clone(); // config 클론
@@ -328,8 +375,9 @@ pub async fn proxy_tls_streams(
             // config에서 buffer_size 가져오기
             let buffer_size = config_clone.as_ref()
                 .map(|c| c.buffer_size)
-                .unwrap_or(constants::BUFFER_SIZE_MEDIUM);
+                .unwrap_or(constants::DEFAULT_BUFFER_SIZE);
                 
+            debug!("[Session:{}] TLS 서버→클라이언트 버퍼 크기: {}", session_id_str, buffer_size);
             let mut resp_buffer = BytesMut::with_capacity(buffer_size);
             let mut current_resp_id = 0u64;
             
@@ -337,8 +385,8 @@ pub async fn proxy_tls_streams(
             let header_searcher = TwoWaySearcher::new(HEADER_END_PATTERN);
             let chunk_searcher = TwoWaySearcher::new(CHUNK_END_PATTERN);
             
-            // 버퍼 재사용을 위한 초기화
-            let mut buffer = BytesMut::with_capacity(constants::BUFFER_SIZE_MEDIUM);
+            // 버퍼 재사용을 위한 초기화 - 설정된 버퍼 크기 사용
+            let mut buffer = BytesMut::with_capacity(buffer_size);
             
             loop {
                 buffer.clear(); // 버퍼 재사용
@@ -374,6 +422,9 @@ pub async fn proxy_tls_streams(
                                 if let Some(start_time) = start_time_opt {
                                     let response_time = start_time.elapsed().as_millis() as u64;
                                     
+                                    // 응답 시간 메트릭 기록
+                                    metrics_clone.record_response_time(response_time);
+                                    
                                     // 상태 코드 추출
                                     let mut status_code = 200;
                                     if let Ok(status_line) = std::str::from_utf8(&resp_buffer[..headers_end_pos]) {
@@ -381,6 +432,7 @@ pub async fn proxy_tls_streams(
                                             if let Some(code_str) = first_line.split_whitespace().nth(1) {
                                                 if let Ok(code) = code_str.parse::<u16>() {
                                                     status_code = code;
+                                                    debug!("[Session:{}] TLS 응답 상태 코드: {}", session_id_str, code);
                                                 }
                                             }
                                         }
@@ -437,18 +489,43 @@ pub async fn proxy_tls_streams(
                         
                         // 클라이언트에 데이터 전송
                         if let Err(e) = client_write.write_all(&buffer).await {
-                            error!("[Session:{}] 클라이언트 쓰기 오류: {}", session_id_str, e);
-                            return Err(e.into());
+                            // 연결 종료 오류는 정상적인 종료로 처리
+                            if e.kind() == io::ErrorKind::BrokenPipe || 
+                               e.kind() == io::ErrorKind::ConnectionReset || 
+                               e.kind() == io::ErrorKind::ConnectionAborted {
+                                debug!("[Session:{}] 클라이언트 연결 종료: {}", session_id_str, e);
+                                break;
+                            } else {
+                                error!("[Session:{}] 클라이언트 쓰기 오류: {}", session_id_str, e);
+                                return Err(ProxyError::Io(e));
+                            }
+                        }
+                        
+                        // 버퍼를 플러시하여 데이터가 즉시 전송되도록 함
+                        if let Err(e) = client_write.flush().await {
+                            if e.kind() == io::ErrorKind::BrokenPipe || 
+                               e.kind() == io::ErrorKind::ConnectionReset || 
+                               e.kind() == io::ErrorKind::ConnectionAborted {
+                                debug!("[Session:{}] 클라이언트 플러시 중 연결 종료: {}", session_id_str, e);
+                                break;
+                            } else {
+                                error!("[Session:{}] 클라이언트 플러시 오류: {}", session_id_str, e);
+                                return Err(ProxyError::Io(e));
+                            }
                         }
                         
                         total_bytes += n as u64;
                         metrics_clone.add_tls_bytes_out(n as u64);
                     },
                     Err(e) => {
-                        if e.kind() == io::ErrorKind::UnexpectedEof {
-                            debug!("[Session:{}] 서버 연결 종료", session_id_str);
+                        if e.kind() == io::ErrorKind::UnexpectedEof || 
+                           e.kind() == io::ErrorKind::BrokenPipe || 
+                           e.kind() == io::ErrorKind::ConnectionReset || 
+                           e.kind() == io::ErrorKind::ConnectionAborted {
+                            debug!("[Session:{}] 서버 연결 종료: {}", session_id_str, e);
                         } else {
                             error!("[Session:{}] 서버 읽기 오류: {}", session_id_str, e);
+                            metrics_clone.increment_error_count();
                         }
                         break;
                     }

@@ -19,7 +19,7 @@ use rustls_pemfile;
 
 use crate::constants::*;
 use crate::config::Config;
-use crate::error::{ProxyError, Result, tls_err, internal_err};
+use crate::error::{Result, tls_err, internal_err};
 
 // 루트 CA 인증서와 키를 저장하는 전역 변수
 static ROOT_CA: Lazy<Mutex<Option<Certificate>>> = Lazy::new(|| Mutex::new(None));

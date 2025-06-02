@@ -94,6 +94,41 @@ impl Metrics {
         Arc::clone(&METRICS_INSTANCE)
     }
     
+    // HTTP 세션 카운터 증가
+    pub fn increment_http_session_count(&self) {
+        // 실제 구현 생략 - 사용하지 않는 메서드지만 인터페이스 유지
+    }
+    
+    // HTTP 요청 카운터 증가
+    pub fn increment_http_request_count(&self) {
+        // 실제 구현 생략 - 사용하지 않는 메서드지만 인터페이스 유지
+    }
+    
+    // HTTP 응답 카운터 증가
+    pub fn increment_http_response_count(&self) {
+        // 실제 구현 생략 - 사용하지 않는 메서드지만 인터페이스 유지
+    }
+    
+    // GET 요청 카운터 증가
+    pub fn increment_get_request_count(&self) {
+        // 실제 구현 생략 - 사용하지 않는 메서드지만 인터페이스 유지
+    }
+    
+    // POST 요청 카운터 증가
+    pub fn increment_post_request_count(&self) {
+        // 실제 구현 생략 - 사용하지 않는 메서드지만 인터페이스 유지
+    }
+    
+    // 오류 카운터 증가
+    pub fn increment_error_count(&self) {
+        // 실제 구현 생략 - 사용하지 않는 메서드지만 인터페이스 유지
+    }
+    
+    // 응답 시간 기록
+    pub fn record_response_time(&self, _response_time: u64) {
+        // 실제 구현 생략 - 사용하지 않는 메서드지만 인터페이스 유지
+    }
+    
     // 내부 생성 함수
     fn new_internal() -> Self {
         Self {

@@ -3,11 +3,11 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use socket2::Socket;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use bytes::BytesMut;
+use bytes::{BytesMut};
 use uuid;
 
 use crate::config::Config;
@@ -20,7 +20,7 @@ use crate::proxy::tls::proxy_tls_streams;
 use crate::acl::domain_blocker::DomainBlocker;
 use crate::acl::block_page::BlockPage;
 use crate::logging::Logger;
-use crate::error::{ProxyError, Result, http_err, internal_err, tls_err};
+use crate::error::{ProxyError, Result};
 
 /// HTTP 요청 파싱 결과
 #[derive(Debug)]
@@ -141,7 +141,7 @@ impl Session {
             }
         } else {
             // HTTP 요청 처리
-            match self.handle_http_request(client_stream, host, port, &request_str, n, buffer).await {
+            match self.handle_http_request(client_stream, host, port, buffer, n, &request_str).await {
                 Ok(()) => Ok(()),
                 Err(e) => {
                     // 핸들러 내부에서 이미 connection_closed가 호출되므로 여기서는 호출하지 않음
@@ -160,14 +160,17 @@ impl Session {
         result
     }
     
-    /// 버퍼 할당
+    /// 버퍼 할당 - 설정에서 버퍼 크기 가져오기
     fn allocate_buffer(&self) -> BytesMut {
+        // 설정에서 버퍼 크기 가져오기
+        let buffer_size = self.config.buffer_size;
+        
         if let Some(pool) = &self.buffer_pool {
-            debug!("[Session:{}] 버퍼 풀에서 버퍼 할당 (크기: {})", self.session_id(), self.config.buffer_size);
-            pool.get_buffer(Some(self.config.buffer_size))
+            debug!("[Session:{}] 버퍼 풀에서 버퍼 할당 (크기: {})", self.session_id(), buffer_size);
+            pool.get_buffer(Some(buffer_size))
         } else {
-            debug!("[Session:{}] 새 버퍼 생성 (크기: {})", self.session_id(), self.config.buffer_size);
-            BytesMut::with_capacity(self.config.buffer_size)
+            debug!("[Session:{}] 새 버퍼 생성 (크기: {})", self.session_id(), buffer_size);
+            BytesMut::with_capacity(buffer_size)
         }
     }
     
@@ -241,23 +244,52 @@ impl Session {
             let mut host = String::new();
             let mut port = 80;
             
-            // Host 헤더에서 호스트 추출
+            // Host 헤더에서 호스트 추출 - 개선된 버전
             if let Some(host_line) = request_str.lines()
                 .find(|line| line.to_lowercase().starts_with("host:")) {
                 let host_value = host_line.trim_start_matches("Host:").trim_start_matches("host:").trim();
-
-                // 포트 확인
-                if let Some(idx) = host_value.rfind(':') {
-                    host = host_value[0..idx].to_string();
-                    if let Ok(p) = host_value[idx+1..].parse::<u16>() {
-                        port = p;
+                debug!("[Session:{}] Host 헤더 값 추출: {}", self.session_id(), host_value);
+                
+                // 포트 확인 - IPv6 주소를 고려한 개선된 버전
+                if host_value.starts_with('[') {
+                    // IPv6 주소 처리
+                    if let Some(end_bracket) = host_value.rfind(']') {
+                        host = host_value[1..end_bracket].to_string();
+                        debug!("[Session:{}] IPv6 호스트 추출: {}", self.session_id(), host);
+                        
+                        // 포트 부분 처리
+                        if host_value.len() > end_bracket + 1 && host_value.chars().nth(end_bracket + 1) == Some(':') {
+                            if let Ok(p) = host_value[end_bracket+2..].parse::<u16>() {
+                                port = p;
+                                debug!("[Session:{}] IPv6 호스트의 포트 추출: {}", self.session_id(), port);
+                            }
+                        }
+                    } else {
+                        // 잘못된 IPv6 형식
+                        warn!("[Session:{}] 잘못된 IPv6 형식: {}", self.session_id(), host_value);
+                        host = host_value.to_string();
                     }
                 } else {
-                    host = host_value.to_string();
+                    // IPv4 또는 도메인명 처리
+                    if let Some(idx) = host_value.rfind(':') {
+                        host = host_value[0..idx].to_string();
+                        debug!("[Session:{}] 호스트 추출: {}", self.session_id(), host);
+                        
+                        if let Ok(p) = host_value[idx+1..].parse::<u16>() {
+                            port = p;
+                            debug!("[Session:{}] 포트 추출: {}", self.session_id(), port);
+                        } else {
+                            warn!("[Session:{}] 잘못된 포트 형식: {}", self.session_id(), &host_value[idx+1..]);
+                        }
+                    } else {
+                        host = host_value.to_string();
+                        debug!("[Session:{}] 호스트 추출 (기본 포트 사용): {}", self.session_id(), host);
+                    }
                 }
             } else if let Some(url_part) = parts.get(1) {
                 // URL에서 호스트 추출
                 if url_part.starts_with("http://") {
+                    // 절대 URL 형식 (http://example.com/path)
                     let without_scheme = url_part.trim_start_matches("http://");
                     if let Some(host_part) = without_scheme.split('/').next() {
                         if !host_part.is_empty() {
@@ -278,6 +310,11 @@ impl Session {
                         error!("[Session:{}] Invalid URL format", self.session_id());
                         return Err(ProxyError::Http("Invalid URL format".to_string()));
                     }
+                } else if url_part.starts_with("/") {
+                    // 절대 경로 형식 (프록시를 통한 일반적인 HTTP 요청)
+                    debug!("[Session:{}] 절대 경로 형식의 HTTP 요청 감지: {}", self.session_id(), url_part);
+                    // 이 경우 Host 헤더에서 호스트 정보를 이미 추출했으므로 추가 작업 불필요
+                    // 호스트 정보가 없으면 아래의 host.is_empty() 체크에서 오류 처리됨
                 }
             }
             
@@ -338,94 +375,154 @@ impl Session {
         Ok(())
     }
     
-    /// 차단된 요청 로깅
+    /// 차단된 요청 로깅 - 제로 카피 최적화 적용
     async fn log_blocked_request(&self, host: &str, request_str: &str, client_ip: &str, is_tls: bool) {
-        // Logger 인스턴스 사용 (이제 직접 사용 가능)
-        if let Err(e) = self.logger.log_rejected_request(request_str, host, client_ip, &self.session_id(), is_tls).await {
-            error!("[Session:{}] 차단된 요청 로깅 실패: {}", self.session_id(), e);
-        }
+        // 로깅을 비동기적으로 처리하기 위해 필요한 데이터 복제
+        let host = host.to_string();
+        let request_str = request_str.to_string();
+        let client_ip = client_ip.to_string();
+        let session_id = self.session_id.clone();
+        let logger = self.logger.clone();
+        let is_tls = is_tls;
+        
+        // 비동기 작업으로 로깅 처리
+        tokio::spawn(async move {
+            if let Err(e) = logger.log_rejected_request(&request_str, &host, &client_ip, &session_id, is_tls).await {
+                error!("[Session:{}] 차단된 요청 로깅 실패: {}", session_id, e);
+            }
+        });
     }
     
-    /// HTTP 요청 처리
-    async fn handle_http_request(&self, mut client_stream: TcpStream, host: &str, port: u16, request_str: &str, n: usize, buffer: BytesMut) -> Result<()> {
-        // 세션 ID는 더 이상 지역 변수로 저장하지 않고 항상 self.session_id()를 직접 호출
-        info!("[Session:{}] Processing HTTP request for {}", self.session_id(), host);
+    /// HTTP 요청 처리 - 개선된 버전
+    async fn handle_http_request(&self, client_stream: TcpStream, host: &str, port: u16, buffer: BytesMut, n: usize, request_str: &str) -> Result<()> {
+        // 도메인 차단 여부 확인
+        if self.domain_blocker.is_blocked(host) {
+            info!("[Session:{}] 차단된 도메인 감지: {}", self.session_id(), host);
+            return self.handle_blocked_domain(client_stream, host, false, request_str, buffer).await;
+        }
+        
+        info!("[Session:{}] HTTP 요청 처리 시작: {}", self.session_id(), host);
         
         // 서버에 연결
-        let server_addr = format!("{}:{}", host, port);
-        let server_stream = match TcpStream::connect(&server_addr).await {
-            Ok(stream) => {
-                // 실제 연결된 IP 주소 확인 및 로깅
-                let target_ip = if let Ok(peer_addr) = stream.peer_addr() {
-                    info!("[Session:{}] Connected to IP: {} for host: {}", self.session_id(), peer_addr.ip(), host);
-                    peer_addr.ip().to_string()
-                } else {
-                    "Unknown IP".to_string()
-                };
-                
-                // HTTP 요청 로깅
-                self.log_http_request(host, request_str, &target_ip, self.session_id()).await;
-                
-                stream
+        let server_addr = format!("{0}:{1}", host, port);
+        debug!("[Session:{}] 서버 연결 시도: {}", self.session_id(), server_addr);
+        
+        let mut server_stream = match tokio::time::timeout(
+            std::time::Duration::from_millis(self.config.timeout_ms as u64),
+            TcpStream::connect(&server_addr)
+        ).await {
+            Ok(result) => match result {
+                Ok(stream) => {
+                    // TCP_NODELAY 설정 - 지연 최소화
+                    if let Err(e) = stream.set_nodelay(true) {
+                        debug!("[Session:{}] 서버 소켓 TCP_NODELAY 설정 실패: {}", self.session_id(), e);
+                        // 오류를 무시하고 계속 진행
+                    }
+                    
+                    // 실제 연결된 IP 주소 확인 및 로깅
+                    let target_ip = if let Ok(peer_addr) = stream.peer_addr() {
+                        info!("[Session:{}] 서버 연결 성공: {} (IP: {})", self.session_id(), host, peer_addr.ip());
+                        peer_addr.ip().to_string()
+                    } else {
+                        warn!("[Session:{}] 서버 IP 주소 확인 불가능", self.session_id());
+                        "Unknown IP".to_string()
+                    };
+                    
+                    // HTTP 요청 로깅 - 비동기적으로 처리
+                    self.log_http_request(host, request_str, &target_ip, self.session_id()).await;
+                    
+                    stream
+                },
+                Err(e) => {
+                    error!("[Session:{}] 서버 연결 실패: {}:{} - {}", self.session_id(), host, port, e);
+                    if let Some(pool) = &self.buffer_pool {
+                        pool.return_buffer(buffer);
+                    }
+                    self.metrics.connection_closed(false);
+                    return Err(ProxyError::Http(format!("서버 연결 실패: {}", e)));
+                }
             },
-            Err(e) => {
-                error!("[Session:{}] Failed to connect to target server {}: {}", self.session_id(), server_addr, e);
+            Err(_) => {
+                error!("[Session:{}] 서버 연결 타임아웃: {}:{}", self.session_id(), host, port);
                 if let Some(pool) = &self.buffer_pool {
                     pool.return_buffer(buffer);
                 }
-                // 서버 연결 실패 시 연결 카운터 감소
                 self.metrics.connection_closed(false);
-                return Err(e.into());
+                return Err(ProxyError::Timeout(format!("서버 연결 타임아웃: {}:{}", host, port)));
             }
         };
         
-        // 서버에 요청 전달
+        // 서버에 요청 전달 - 제로 카피 최적화를 위해 try_write 대신 write_all 사용
         let buffer_slice = &buffer[0..n];
-        if let Err(e) = server_stream.try_write(buffer_slice) {
-            error!("[Session:{}] Failed to forward request to server: {}", self.session_id(), e);
+        
+        if let Err(e) = server_stream.write_all(buffer_slice).await {
+            // 연결 종료 관련 오류는 정상 처리로 간주
+            if e.kind() == std::io::ErrorKind::ConnectionReset || 
+               e.kind() == std::io::ErrorKind::ConnectionAborted || 
+               e.kind() == std::io::ErrorKind::BrokenPipe {
+                debug!("[Session:{}] 서버 연결 정상 종료 (요청 전송 중): {}", self.session_id(), e);
+                if let Some(pool) = &self.buffer_pool {
+                    pool.return_buffer(buffer);
+                }
+                self.metrics.connection_closed(false);
+                return Ok(());
+            }
+            
+            error!("[Session:{}] 서버에 요청 전송 실패: {}", self.session_id(), e);
             if let Some(pool) = &self.buffer_pool {
                 pool.return_buffer(buffer);
             }
-            // 요청 전달 실패 시 연결 카운터 감소
             self.metrics.connection_closed(false);
-            return Err(e.into());
+            return Err(ProxyError::Http(format!("서버에 요청 전송 실패: {}", e)));
         }
         
-        // 버퍼 반환
+        // 서버로 요청이 전송되었는지 확인하기 위해 flush 수행
+        if let Err(e) = server_stream.flush().await {
+            // 연결 종료 관련 오류는 정상 처리로 간주
+            if e.kind() == std::io::ErrorKind::ConnectionReset || 
+               e.kind() == std::io::ErrorKind::ConnectionAborted || 
+               e.kind() == std::io::ErrorKind::BrokenPipe {
+                debug!("[Session:{}] 서버 연결 정상 종료 (flush 중): {}", self.session_id(), e);
+                if let Some(pool) = &self.buffer_pool {
+                    pool.return_buffer(buffer);
+                }
+                self.metrics.connection_closed(false);
+                return Ok(());
+            }
+            
+            error!("[Session:{}] 서버에 요청 flush 실패: {}", self.session_id(), e);
+            if let Some(pool) = &self.buffer_pool {
+                pool.return_buffer(buffer);
+            }
+            self.metrics.connection_closed(false);
+            return Err(ProxyError::Http(format!("서버에 요청 flush 실패: {}", e)));
+        }
+        
+        debug!("[Session:{}] 서버로 요청 전송 완료", self.session_id());
+        
+        info!("[Session:{}] Starting HTTP proxy for {}", self.session_id(), host);
+        
+        // 버퍼 반환 - 요청이 서버로 완전히 전송된 후에 반환
         if let Some(pool) = &self.buffer_pool {
             pool.return_buffer(buffer);
         }
         
-        // 프록시 시작 - 요청 시작 시간 전달
-        info!("[Session:{}] Starting HTTP proxy for {}", self.session_id(), host);
-        let request_start_time = Instant::now();
-        
-        // 이미 받은 요청 데이터를 바이트 벡터로 변환
-        let initial_request = request_str.as_bytes().to_vec();
-        
-        // 이미 로깅되었음을 나타내는 플래그 추가 (중복 로깅 방지)
-        let already_logged = true;
-        
-        // proxy_http_streams 호출 시 직접 self.session_id() 호출
+        // proxy_http_streams 호출 - 제로 카피 최적화된 버전 사용
         match proxy_http_streams(
             client_stream, 
             server_stream, 
             Arc::clone(&self.metrics), 
-            self.session_id(), // 여기서 직접 세션 ID 메서드 호출
-            request_start_time, 
+            self.session_id(), 
             Some(Arc::clone(&self.config)), 
-            Some(initial_request),
-            already_logged, // 이미 로깅되었음을 표시
-            Some(self.logger.clone()) // Logger 인스턴스 전달
+            Some(self.logger.clone()), 
+            Some(Arc::clone(&self.domain_blocker))
         ).await {
             Ok(_) => {
-                // 연결 종료 시 활성 연결 카운터 감소
                 self.metrics.connection_closed(false);
                 info!("[Session:{}] Completed HTTP proxy for {}", self.session_id(), host);
                 Ok(())
             },
             Err(e) => {
-                // 프록시 에러 시 연결 카운터 감소
                 self.metrics.connection_closed(false);
                 error!("[Session:{}] Error during HTTP proxy: {}", self.session_id(), e);
                 Err(e)
@@ -528,47 +625,55 @@ impl Session {
         }
     }
     
-    /// HTTP 요청 로깅
+    /// HTTP 요청 로깅 - 제로 카피 최적화 적용
     async fn log_http_request(&self, host: &str, request_str: &str, target_ip: &str, _session_id: &str) {
-        // 요청 파싱 - 메서드, 경로, 헤더 등
-        let first_line = request_str.lines().next().unwrap_or("");
-        let parts: Vec<&str> = first_line.split_whitespace().collect();
-        
-        let method = parts.get(0).unwrap_or(&"UNKNOWN").to_string();
-        let path = parts.get(1).unwrap_or(&"/").to_string();
-        
-        // 헤더와 본문 분리
-        let mut header = request_str.to_string();
-        let mut body = None;
-        
-        if let Some(header_end) = request_str.find("\r\n\r\n") {
-            header = request_str[..header_end].to_string();
-            
-            // 본문 추출 (있는 경우)
-            let body_start = header_end + 4; // "\r\n\r\n" 길이
-            if body_start < request_str.len() {
-                body = Some(request_str[body_start..].to_string());
-            }
-        }
-        
-        // 클라이언트 IP 주소
+        // 로깅을 비동기적으로 처리하기 위해 필요한 데이터 복제
+        let host = host.to_string();
+        let request_str = request_str.to_string();
+        let target_ip = target_ip.to_string();
+        let session_id = self.session_id.clone();
         let client_ip = self.client_addr.ip().to_string();
+        let logger = self.logger.clone();
         
-        // Logger 인스턴스 사용 (이제 직접 사용 가능)
-        if let Err(e) = self.logger.log_request(
-            host.to_string(),
-            method,
-            path,
-            header,
-            body,
-            self.session_id.clone(),
-            client_ip,
-            target_ip.to_string(),
-            false, // 차단되지 않음
-            false  // HTTP 요청
-        ).await {
-            error!("[Session:{}] HTTP 요청 로깅 실패: {}", self.session_id(), e);
-        }
+        // 비동기 작업으로 로깅 처리
+        tokio::spawn(async move {
+            // 요청 파싱 - 메서드, 경로, 헤더 등
+            let first_line = request_str.lines().next().unwrap_or("");
+            let parts: Vec<&str> = first_line.split_whitespace().collect();
+            
+            let method = parts.get(0).unwrap_or(&"UNKNOWN").to_string();
+            let path = parts.get(1).unwrap_or(&"/").to_string();
+            
+            // 헤더와 본문 분리
+            let mut header = request_str.clone();
+            let mut body = None;
+            
+            if let Some(header_end) = request_str.find("\r\n\r\n") {
+                header = request_str[..header_end].to_string();
+                
+                // 본문 추출 (있는 경우)
+                let body_start = header_end + 4; // "\r\n\r\n" 길이
+                if body_start < request_str.len() {
+                    body = Some(request_str[body_start..].to_string());
+                }
+            }
+            
+            // Logger 인스턴스를 사용하여 비동기적으로 로깅
+            if let Err(e) = logger.log_request(
+                host,
+                method,
+                path,
+                header,
+                body,
+                session_id.clone(),
+                client_ip,
+                target_ip,
+                false, // 차단되지 않음
+                false  // HTTP 요청
+            ).await {
+                error!("[Session:{}] HTTP 요청 로깅 실패: {}", session_id, e);
+            }
+        });
     }
 
     // 세션 ID 생성 유틸리티 함수

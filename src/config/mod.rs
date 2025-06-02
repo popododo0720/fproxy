@@ -9,6 +9,11 @@ use lazy_static::lazy_static;
 use std::sync::RwLock;
 use log::{debug, error};
 
+// 설정 관리 모듈 내보내기
+mod settings;
+pub use settings::Settings;
+pub use settings::ConfigSource;
+
 // 정규표현식 캐시
 lazy_static! {
     static ref REGEX_CACHE: RwLock<std::collections::HashMap<String, Regex>> = RwLock::new(std::collections::HashMap::new());

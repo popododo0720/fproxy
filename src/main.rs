@@ -1,14 +1,13 @@
 use std::path::Path;
 use std::sync::Arc;
 use std::io::Write;
-use log::{debug, error, info, warn, LevelFilter};
+
+
+use log::{debug, info, warn, error, LevelFilter};
+use once_cell::sync::Lazy;
 use chrono::Local;
 use env_logger::Builder;
-use once_cell::sync::Lazy;
 
-mod config;
-mod metrics;
-mod buffer;
 mod constants;
 mod server;
 mod session;
@@ -18,19 +17,20 @@ mod acl;
 mod db;
 mod logging;
 mod error;
+mod config;
+mod metrics;
+mod buffer;
 
-use error::{ProxyError, Result, config_err, db_err, internal_err};
-
-use config::Config;
-use metrics::Metrics;
-use buffer::BufferPool;
-use constants::*;
-use server::ProxyServer;
-use tls::init_root_ca;
-use tls::load_trusted_certificates;
-use logging::Logger;
-use acl::domain_blocker::DomainBlocker;
-use db::config::DbConfig;
+use crate::config::{Config, Settings};
+use crate::db::config::DbConfig;
+use crate::error::{Result, ProxyError, config_err, db_err};
+use crate::acl::domain_blocker::DomainBlocker;
+use crate::logging::Logger;
+use crate::server::ProxyServer;
+use crate::metrics::Metrics;
+use crate::buffer::BufferPool;
+use crate::constants::*;
+use crate::tls::init_root_ca;
 
 // 파일 디스크립터 제한 설정
 static FD_LIMIT: Lazy<u64> = Lazy::new(|| {
@@ -43,20 +43,24 @@ static FD_LIMIT: Lazy<u64> = Lazy::new(|| {
 #[tokio::main]
 async fn main() -> Result<()> {
     // 로거 초기화
-    setup_logger();
+    env_logger::init();
+    info!("UDSS 프록시 서버 시작");
     
-    // 시스템 리소스 제한 설정
-    setup_resource_limits();
-
-    info!("udss-proxy 서버 시작 중...");
-    let num_cpus = num_cpus::get();
-    info!("시스템 코어 수: {}", num_cpus);
-
-    // 프록시 설정 로드
-    let mut config = load_config()?;
+    // 통합 설정 로드
+    let mut settings = Settings::new()?;
     
-    // 데이터베이스 설정 로드 및 초기화
-    setup_database().await?;
+    // 환경 변수에서 설정 오버라이드
+    settings.override_from_env()?;
+    
+    // 설정 정보 로그 출력
+    settings.log_settings();
+    
+    // 인증서 로드
+    load_trusted_certificates(&mut settings.proxy)?;
+    let config = Arc::new(settings.proxy);
+    
+    // 데이터베이스 설정 및 초기화 (통합 설정 사용)
+    setup_database(&settings.database).await?;
 
     // SSL 디렉토리 확인 및 생성
     ensure_ssl_directories(&config)?;
@@ -67,14 +71,6 @@ async fn main() -> Result<()> {
     } else {
         info!("루트 CA 초기화 성공");
     }
-    
-    // ssl/trusted_certs 폴더에서 신뢰할 인증서 자동 로드
-    if let Err(e) = load_trusted_certificates(&mut config) {
-        error!("신뢰할 인증서 로드 실패: {}", e);
-    }
-    
-    // config를 Arc로 감싸서 공유 가능하게 함
-    let config = Arc::new(config);
     
     // 메트릭스 초기화
     let metrics = Metrics::new();
@@ -94,7 +90,7 @@ async fn main() -> Result<()> {
     let logger = Arc::new(logger);
     
     // 워커 스레드 설정
-    let worker_threads = config.worker_threads.unwrap_or_else(|| num_cpus);
+    let worker_threads = config.worker_threads.unwrap_or_else(|| num_cpus::get());
     
     // DomainBlocker 인스턴스 생성 (config는 이미 Arc<Config> 타입)
     let domain_blocker = Arc::new(DomainBlocker::new(config.clone()));
@@ -159,39 +155,46 @@ fn setup_resource_limits() {
     }
 }
 
-/// 프록시 설정 로드
-fn load_config() -> Result<Config> {
-    // 먼저 현재 디렉토리의 config.yml 파일 확인
-    if Path::new("config.yml").exists() {
-        info!("설정 파일 로드: config.yml");
-        return Ok(Config::from_file("config.yml")?);
+/// 인증서 로드 함수
+fn load_trusted_certificates(config: &mut Config) -> Result<()> {
+    info!("신뢰할 수 있는 인증서 로드");
+    
+    // 인증서 디렉토리 확인
+    let cert_dir = Path::new(&config.ssl_dir);
+    if !cert_dir.exists() || !cert_dir.is_dir() {
+        warn!("인증서 디렉토리가 존재하지 않습니다: {}", config.ssl_dir);
+        return Ok(());
     }
     
-    // 환경 변수에서 설정 파일 경로 확인
-    match std::env::var("CONFIG_FILE") {
-        Ok(path) => {
-            info!("환경 변수에서 설정 파일 로드: {}", path);
-            Ok(Config::from_file(&path).map_err(|e| config_err(e))?)
-        },
-        Err(_) => {
-            info!("설정 파일을 찾을 수 없어 기본 설정 사용");
-            Ok(Config::new())
+    // 인증서 파일 로드
+    let cert_files = std::fs::read_dir(cert_dir)
+        .map_err(|e| config_err(format!("인증서 디렉토리 읽기 실패: {}", e)))?;
+    
+    for entry in cert_files {
+        if let Ok(entry) = entry {
+            let path = entry.path();
+            if path.is_file() && path.extension().map_or(false, |ext| ext == "pem" || ext == "crt") {
+                if let Some(path_str) = path.to_str() {
+                    config.trusted_certificates.push(path_str.to_string());
+                    info!("인증서 로드: {}", path_str);
+                }
+            }
         }
     }
+    
+    info!("총 {} 개의 인증서 로드됨", config.trusted_certificates.len());
+    Ok(())
 }
 
 /// 데이터베이스 설정 및 초기화
-async fn setup_database() -> Result<()> {
-    // DB 설정 로드
-    let db_config_path = std::env::var("DB_CONFIG_FILE").unwrap_or_else(|_| "db.yml".to_string());
-    if Path::new(&db_config_path).exists() {
-        info!("데이터베이스 설정 로드: {}", db_config_path);
-        if let Err(e) = DbConfig::initialize(&db_config_path) {
-            error!("데이터베이스 설정 로드 실패: {}", e);
-            return Err(db_err(e));
-        }
+async fn setup_database(db_config: &DbConfig) -> Result<()> {
+    // DB 설정 글로벌 변수 업데이트
+    if let Ok(mut global_config) = db::config::DB_CONFIG.write() {
+        *global_config = db_config.clone();
+        info!("데이터베이스 설정 업데이트 완료");
     } else {
-        info!("기본 데이터베이스 설정 사용");
+        error!("데이터베이스 글로벌 설정 업데이트 실패");
+        return Err(db_err("데이터베이스 글로벌 설정 업데이트 실패"));
     }
     
     // DB 연결 풀 초기화
