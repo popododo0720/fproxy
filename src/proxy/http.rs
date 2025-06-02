@@ -1,6 +1,5 @@
 use std::sync::Arc;
 use std::time::{Instant, Duration};
-use std::error::Error;
 
 use log::{debug, error, warn};
 use tokio::net::TcpStream;
@@ -11,6 +10,7 @@ use base64::{self, engine::general_purpose::STANDARD, Engine};
 use crate::metrics::Metrics;
 use crate::config::Config;
 use crate::logging::{Logger, LogFormatter};
+use crate::error::{ProxyError, Result, http_err, internal_err};
 
 // 기본 상수 정의 (config에서 값을 가져오지 못할 경우 사용)
 const DEFAULT_BUFFER_SIZE: usize = 8192;
@@ -100,7 +100,7 @@ pub async fn proxy_http_streams(
     initial_request: Option<Vec<u8>>,
     already_logged: bool,
     logger: Option<Arc<Logger>>,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+) -> Result<()> {
     // 세션 ID를 문자열로 복제하여 일관된 사용 보장
     let session_id_str = session_id.to_string();
     
@@ -149,7 +149,7 @@ pub async fn proxy_http_streams(
         // 서버로 전송
         if let Err(e) = server_stream.write_all(&client_buf).await {
             error!("[Session:{}] 서버에 초기 요청 전송 실패: {}", session_id_str, e);
-            return Err(Box::new(e));
+            return Err(ProxyError::from(e));
         }
         
         // 버퍼 비우기

@@ -1,4 +1,3 @@
-use std::error::Error;
 use std::sync::Arc;
 use std::io;
 use std::time::Instant;
@@ -19,6 +18,7 @@ use crate::metrics::Metrics;
 use crate::constants;
 use crate::config::Config;
 use crate::logging::{Logger, LogFormatter};
+use crate::error::{ProxyError, Result, tls_err, internal_err};
 
 // 패턴 상수 정의 - 전역으로 이동하여 매번 생성하지 않도록 함
 const HEADER_END_PATTERN: &[u8] = b"\r\n\r\n";
