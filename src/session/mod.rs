@@ -20,8 +20,7 @@ use crate::proxy::http::proxy_http_streams;
 use crate::proxy::tls::proxy_tls_streams;
 use crate::acl::domain_blocker::DomainBlocker;
 use crate::acl::block_page::BlockPage;
-use crate::REQUEST_LOGGER;
-use crate::DOMAIN_BLOCKER;
+use crate::logging::Logger;
 
 /// HTTP 요청 파싱 결과
 #[derive(Debug)]
@@ -40,10 +39,19 @@ pub struct Session {
     session_id: String,
     domain_blocker: Arc<DomainBlocker>,
     block_page: BlockPage,
+    logger: Arc<Logger>,
 }
 
 impl Session {
-    pub fn new(client_stream: TcpStream, client_addr: SocketAddr, metrics: Arc<Metrics>, config: Arc<Config>, buffer_pool: Option<Arc<BufferPool>>) -> Self {
+    pub fn new(
+        client_stream: TcpStream, 
+        client_addr: SocketAddr, 
+        metrics: Arc<Metrics>, 
+        config: Arc<Config>, 
+        buffer_pool: Option<Arc<BufferPool>>,
+        logger: Arc<Logger>,
+        domain_blocker: Arc<DomainBlocker>
+    ) -> Self {
         let session_id = Session::generate_unique_id(&client_addr);
         
         Self {
@@ -53,8 +61,9 @@ impl Session {
             config: Arc::clone(&config),
             buffer_pool,
             session_id,
-            domain_blocker: DOMAIN_BLOCKER.clone(),
-            block_page: BlockPage::new(),
+            domain_blocker,
+            block_page: BlockPage::new().with_logger(logger.clone()),
+            logger,
         }
     }
 
@@ -290,239 +299,60 @@ impl Session {
     
     /// 차단된 도메인 처리
     async fn handle_blocked_domain(&self, mut client_stream: TcpStream, host: &str, is_connect: bool, request_str: &str, buffer: BytesMut) -> Result<(), Box<dyn Error + Send + Sync>> {
-        info!("[Session:{}] Blocked access to domain: {}", self.session_id(), host);
+        info!("[Session:{}] 차단된 도메인 감지: {}", self.session_id(), host);
         
         // 클라이언트 IP 주소 가져오기
         let client_ip = self.client_addr.ip().to_string();
         
-        if !is_connect {
-            // HTTP 차단 페이지 전송
-            if let Err(e) = self.block_page.send_http_block_page(
-                &mut client_stream, 
-                host, 
-                &self.session_id(),
-                Some(request_str),
-                Some(&client_ip)
-            ).await {
-                error!("[Session:{}] Failed to send HTTP block page: {}", self.session_id(), e);
-            }
-            
-            // 로그 저장 - 차단된 HTTP 요청
-            self.log_blocked_request(host, request_str, &client_ip, false).await;
-            
-        } else {
-            // HTTPS 차단 페이지 전송
-            if let Err(e) = self.block_page.handle_https_block(
-                client_stream, 
-                host, 
-                &self.session_id(),
-                Some(request_str),
-                Some(&client_ip)
-            ).await {
-                error!("[Session:{}] Failed to handle HTTPS block: {}", self.session_id(), e);
-            }
-            
-            // 로그 저장 - 차단된 HTTPS 요청
-            self.log_blocked_request(host, request_str, &client_ip, true).await;
-            
-            // 연결 종료 시 활성 연결 카운트 감소
-            self.metrics.connection_closed(true);
-        }
-        
-        if let Some(pool) = &self.buffer_pool {
-            pool.return_buffer(buffer);
-        }
-        
-        Ok(())
-    }
-    
-    /// 차단된 요청 로깅
-    async fn log_blocked_request(&self, host: &str, request_str: &str, client_ip: &str, is_tls: bool) {
-        if let Ok(logger) = REQUEST_LOGGER.try_read() {
-            // 요청 파싱
-            let mut method = "UNKNOWN".to_string();
-            let mut path = "/".to_string();
-            let mut body = None;
-            
-            // 요청 라인 추출 및 메서드, 경로 파싱
-            if let Some(first_line) = request_str.lines().next() {
-                let parts: Vec<&str> = first_line.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    method = parts[0].to_string();
-                    path = parts[1].to_string();
-                }
-            }
-            
-            // 헤더와 본문 분리
-            let headers;
-            if let Some(header_end) = request_str.find("\r\n\r\n") {
-                headers = request_str[..header_end].to_string();
-                
-                // 본문 추출 (있는 경우)
-                let body_start = header_end + 4; // "\r\n\r\n" 길이
-                if body_start < request_str.len() {
-                    body = Some(request_str[body_start..].to_string());
-                }
-            } else {
-                headers = request_str.to_string();
-            }
-            
-            // 로그 저장
-            if let Err(e) = logger.log_async(
-                host.to_string(),
-                &method,
-                &path,
-                &headers,
-                body,
-                self.session_id(),
-                client_ip,
-                "Blocked", // 차단된 요청은 타겟 IP를 "Blocked"로 표시
-                None, // 응답 시간 없음
-                true,  // 차단된 요청
-                is_tls  // TLS 여부
-            ) {
-                debug!("[Session:{}] 차단된 요청 로깅 실패: {}", self.session_id(), e);
-            }
-        }
-    }
-    
-    /// HTTPS 요청 처리
-    async fn handle_https_request(&self, mut client_stream: TcpStream, host: &str, port: u16, buffer: BytesMut) -> Result<(), Box<dyn Error + Send + Sync>> {
-        // CONNECT 요청에 대한 승인 응답 전송
-        let response = "HTTP/1.1 200 Connection Established\r\nConnection: keep-alive\r\n\r\n";
-        client_stream.write_all(response.as_bytes()).await?;
-        info!("[Session:{}] CONNECT request approved for {}:{}", self.session_id(), host, port);
+        // 요청 로깅 (차단됨으로 표시)
+        self.log_blocked_request(host, request_str, &client_ip, is_connect).await;
         
         // 버퍼 반환
         if let Some(pool) = &self.buffer_pool {
             pool.return_buffer(buffer);
         }
         
-        // 1. 가짜 인증서로 클라이언트와 TLS 연결
-        let fake_cert = match generate_fake_cert(host).await {
-            Ok(cert) => cert,
-            Err(e) => {
-                error!("[Session:{}] Failed to generate fake certificate: {}", self.session_id(), e);
-                // 에러 발생 시 연결 카운터 감소
-                self.metrics.connection_closed(true);
-                return Err(e);
-            }
-        };
-        
-        info!("[Session:{}] Generated fake certificate for {}", self.session_id(), host);
-        
-        let tls_stream = match accept_tls_with_cert(client_stream, fake_cert).await {
-            Ok(stream) => stream,
-            Err(e) => {
-                error!("[Session:{}] Failed to establish TLS with client: {}", self.session_id(), e);
-                // 에러 발생 시 연결 카운터 감소
-                self.metrics.connection_closed(true);
-                return Err(e);
-            }
-        };
-        
-        info!("[Session:{}] Established TLS with client for {}", self.session_id(), host);
-        
-        // 호스트와 포트 조합
-        let host_port = format!("{}:{}", host, port);
-        
-        // 2. 실제 서버와도 TLS 연결 - 설정 전달하여 인증서 검증 옵션 적용
-        match connect_tls(&host_port, &self.config).await {
-            Ok(real_tls_stream) => {
-                info!("[Session:{}] Connected to real server {} over TLS", self.session_id(), host_port);
-                
-                // 3. 중간에서 데이터 가로채기 - 요청 시작 시간 전달
-                let request_start_time = Instant::now();
-                match proxy_tls_streams(tls_stream, real_tls_stream, Arc::clone(&self.metrics), &self.session_id(), host, request_start_time).await {
-                    Ok(_) => {
-                        // 연결 종료 시 활성 연결 카운터 감소
-                        self.metrics.connection_closed(true);
-                        info!("[Session:{}] Completed TLS proxy for {}", self.session_id(), host);
-                        Ok(())
-                    },
-                    Err(e) => {
-                        // 프록시 스트림에서 에러 발생 시에도 연결 카운터 감소
-                        self.metrics.connection_closed(true);
-                        error!("[Session:{}] Error in TLS proxy: {}", self.session_id(), e);
-                        Err(e)
-                    }
-                }
-            },
-            Err(e) => {
-                // UnknownIssuer 오류 발생 시 설정 안내
-                if e.to_string().contains("UnknownIssuer") {
-                    error!("[Session:{}] 서버 인증서 검증 실패: {}", self.session_id(), e);
-                }
-                // 에러 발생 시 연결 카운터 감소
-                self.metrics.connection_closed(true);
-                Err(e)
-            }
+        // 차단 페이지 전송
+        if is_connect {
+            // HTTPS 요청 차단 처리
+            self.block_page.handle_https_block(
+                client_stream, 
+                host, 
+                &self.session_id(), 
+                Some(request_str), 
+                Some(&client_ip)
+            ).await?;
+        } else {
+            // HTTP 요청 차단 처리
+            self.block_page.send_http_block_page(
+                &mut client_stream, 
+                host, 
+                &self.session_id(), 
+                Some(request_str), 
+                Some(&client_ip)
+            ).await?;
         }
+        
+        info!("[Session:{}] 차단 페이지 전송 완료: {}", self.session_id(), host);
+        
+        // 연결 카운터 감소
+        self.metrics.connection_closed(is_connect);
+        
+        Ok(())
     }
     
-    /// 브라우저 자동 요청 여부 확인
-    fn is_browser_auto_request(&self, request_str: &str) -> bool {
-        // 1. URL 기반 필터링
-        if request_str.contains("GET /favicon.ico") ||
-           request_str.contains("GET /robots.txt") ||
-           request_str.contains("GET /sitemap.xml") ||
-           request_str.contains("GET /manifest.json") ||
-           request_str.contains("GET /site.webmanifest") ||
-           request_str.contains("GET /apple-touch-icon") ||
-           request_str.contains("GET /.well-known/") {
-            return true;
+    /// 차단된 요청 로깅
+    async fn log_blocked_request(&self, host: &str, request_str: &str, client_ip: &str, is_tls: bool) {
+        // Logger 인스턴스 사용 (이제 직접 사용 가능)
+        if let Err(e) = self.logger.log_rejected_request(request_str, host, client_ip, &self.session_id(), is_tls).await {
+            error!("[Session:{}] 차단된 요청 로깅 실패: {}", self.session_id(), e);
         }
-        
-        // 2. 헤더 기반 필터링 (크롤러 봇)
-        if request_str.contains("User-Agent") && (
-            request_str.contains("Googlebot") || 
-            request_str.contains("bingbot") || 
-            request_str.contains("Baiduspider") ||
-            request_str.contains("AdsBot-Google") ||
-            request_str.contains("YandexBot") ||
-            request_str.contains("Bytespider")
-        ) {
-            return true;
-        }
-        
-        // 3. Safari/Chrome/Firefox의 자동 요청 패턴
-        if request_str.contains("Purpose: prefetch") || 
-           request_str.contains("Sec-Purpose: prefetch") {
-            return true;
-        }
-        
-        false
     }
     
     /// HTTP 요청 처리
     async fn handle_http_request(&self, mut client_stream: TcpStream, host: &str, port: u16, request_str: &str, n: usize, buffer: BytesMut) -> Result<(), Box<dyn Error + Send + Sync>> {
         // 세션 ID는 더 이상 지역 변수로 저장하지 않고 항상 self.session_id()를 직접 호출
         info!("[Session:{}] Processing HTTP request for {}", self.session_id(), host);
-        
-        // 요청 내용 분석 - 브라우저 자동 요청 식별
-        let is_browser_auto_request = self.is_browser_auto_request(request_str);
-        
-        // 자동 요청 로깅 (필요한 경우만)
-        if is_browser_auto_request {
-            info!("[Session:{}] 브라우저 자동 요청 감지됨 (favicon 등) - 로깅 생략", self.session_id());
-            
-            // favicon.ico 등 요청에 대해 최적화된 응답 반환 (선택적)
-            if request_str.contains("GET /favicon.ico") {
-                // 빈 favicon 응답 전송 (선택적)
-                let favicon_response = "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n";
-                if let Err(e) = client_stream.write_all(favicon_response.as_bytes()).await {
-                    error!("[Session:{}] favicon 응답 전송 실패: {}", self.session_id(), e);
-                }
-                
-                // 버퍼 반환
-                if let Some(pool) = &self.buffer_pool {
-                    pool.return_buffer(buffer);
-                }
-                
-                info!("[Session:{}] 브라우저 자동 요청에 대한 빠른 응답 완료", self.session_id());
-                return Ok(());
-            }
-        }
         
         // 서버에 연결
         let server_addr = format!("{}:{}", host, port);
@@ -536,10 +366,8 @@ impl Session {
                     "Unknown IP".to_string()
                 };
                 
-                // 첫 번째 HTTP 요청 로깅 - 세션에서만 로깅하고, http.rs에서는 로깅하지 않도록 플래그 전달
-                if !is_browser_auto_request {
-                    self.log_http_request(host, request_str, &target_ip, self.session_id()).await;
-                }
+                // HTTP 요청 로깅
+                self.log_http_request(host, request_str, &target_ip, self.session_id()).await;
                 
                 stream
             },
@@ -578,11 +406,6 @@ impl Session {
         // 이미 받은 요청 데이터를 바이트 벡터로 변환
         let initial_request = request_str.as_bytes().to_vec();
         
-        // 브라우저 자동 요청 감지 정보 로깅
-        if is_browser_auto_request {
-            debug!("[Session:{}] 브라우저 자동 요청 감지됨 - 일반 HTTP 요청으로 처리", self.session_id());
-        }
-        
         // 이미 로깅되었음을 나타내는 플래그 추가 (중복 로깅 방지)
         let already_logged = true;
         
@@ -595,7 +418,8 @@ impl Session {
             request_start_time, 
             Some(Arc::clone(&self.config)), 
             Some(initial_request),
-            already_logged // 이미 로깅되었음을 표시
+            already_logged, // 이미 로깅되었음을 표시
+            Some(self.logger.clone()) // Logger 인스턴스 전달
         ).await {
             Ok(_) => {
                 // 연결 종료 시 활성 연결 카운터 감소
@@ -612,74 +436,141 @@ impl Session {
         }
     }
     
-    /// HTTP 요청 로깅
-    async fn log_http_request(&self, host: &str, request_str: &str, target_ip: &str, _session_id: &str) {
-        // 세션 ID 직접 호출 (외부에서 전달받은 세션 ID는 사용하지 않음)
-        let session_id = self.session_id();
+    /// HTTPS 요청 처리
+    async fn handle_https_request(&self, mut client_stream: TcpStream, host: &str, port: u16, buffer: BytesMut) -> Result<(), Box<dyn Error + Send + Sync>> {
+        // 도메인 차단 여부 확인
+        if self.domain_blocker.is_blocked(host) {
+            info!("[Session:{}] 차단된 도메인 감지: {}", self.session_id(), host);
+            return self.handle_blocked_domain(client_stream, host, true, "", buffer).await;
+        }
         
-        // 브라우저 자동 요청 확인 (로그 메시지에 반영)
-        let is_auto_request = self.is_browser_auto_request(request_str);
-        let log_prefix = if is_auto_request {
-            info!("[Session:{}] 브라우저 자동 요청(favicon 등) 로깅 시작", session_id);
-            "[자동요청]"
-        } else {
-            info!("[Session:{}] HTTP 요청 로깅 시작", session_id);
-            ""
+        // 서버 주소 구성
+        let _server_addr = format!("{}:{}", host, port);
+        
+        // CONNECT 응답 전송
+        let response = "HTTP/1.1 200 Connection Established\r\nConnection: keep-alive\r\n\r\n";
+        if let Err(e) = client_stream.write_all(response.as_bytes()).await {
+            error!("[Session:{}] Failed to send CONNECT response: {}", self.session_id(), e);
+            if let Some(pool) = &self.buffer_pool {
+                pool.return_buffer(buffer);
+            }
+            // 연결 실패 시 연결 카운터 감소
+            self.metrics.connection_closed(true);
+            return Err(e.into());
+        }
+        
+        // TLS 연결 시도
+        info!("[Session:{}] TLS 연결 시도: {}", self.session_id(), host);
+        let real_tls_stream = match connect_tls(host, self.config.as_ref()).await {
+            Ok(stream) => {
+                info!("[Session:{}] TLS 연결 성공", self.session_id());
+                stream
+            },
+            Err(e) => {
+                error!("[Session:{}] TLS 연결 실패: {}", self.session_id(), e);
+                return Err(e);
+            }
         };
         
-        if let Ok(logger) = REQUEST_LOGGER.try_read() {
-            // 요청 파싱
-            let mut method = "UNKNOWN".to_string();
-            let mut path = "/".to_string();
-            let mut body = None;
-            
-            // 요청 라인 추출 및 메서드, 경로 파싱
-            if let Some(first_line) = request_str.lines().next() {
-                let parts: Vec<&str> = first_line.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    method = parts[0].to_string();
-                    path = parts[1].to_string();
-                }
+        // 클라이언트 TLS 연결 수락
+        info!("[Session:{}] 클라이언트 TLS 연결 수락 중", self.session_id());
+        
+        // 인증서 생성
+        let cert_key_pair = match generate_fake_cert(host).await {
+            Ok(cert_pair) => cert_pair,
+            Err(e) => {
+                error!("[Session:{}] 가짜 인증서 생성 실패: {}", self.session_id(), e);
+                return Err(e.into());
             }
-            
-            // 헤더와 본문 분리
-            let headers;
-            if let Some(header_end) = request_str.find("\r\n\r\n") {
-                headers = request_str[..header_end].to_string();
+        };
+        
+        match accept_tls_with_cert(client_stream, cert_key_pair).await {
+            Ok(tls_stream) => {
+                info!("[Session:{}] 클라이언트 TLS 연결 수락 성공", self.session_id());
                 
-                // 본문 추출 (있는 경우)
-                let body_start = header_end + 4; // "\r\n\r\n" 길이
-                if body_start < request_str.len() {
-                    body = Some(request_str[body_start..].to_string());
+                // 버퍼 반환 (TLS 모드에서는 더 이상 필요 없음)
+                if let Some(pool) = &self.buffer_pool {
+                    pool.return_buffer(buffer);
                 }
-            } else {
-                headers = request_str.to_string();
+                
+                // 3. 중간에서 데이터 가로채기 - 요청 시작 시간 전달
+                let request_start_time = Instant::now();
+                match proxy_tls_streams(
+                    tls_stream, 
+                    real_tls_stream, 
+                    Arc::clone(&self.metrics), 
+                    &self.session_id(), 
+                    host, 
+                    request_start_time,
+                    Some(self.logger.clone()), // Logger 인스턴스 전달
+                    Some(self.config.clone()) // Config 인스턴스 전달
+                ).await {
+                    Ok(_) => {
+                        // 연결 종료 시 활성 연결 카운터 감소
+                        self.metrics.connection_closed(true);
+                        info!("[Session:{}] Completed TLS proxy for {}", self.session_id(), host);
+                        Ok(())
+                    },
+                    Err(e) => {
+                        // 프록시 스트림에서 에러 발생 시에도 연결 카운터 감소
+                        self.metrics.connection_closed(true);
+                        error!("[Session:{}] Error in TLS proxy: {}", self.session_id(), e);
+                        Err(e)
+                    }
+                }
+            },
+            Err(e) => {
+                // UnknownIssuer 오류 발생 시 설정 안내
+                if e.to_string().contains("UnknownIssuer") {
+                    error!("[Session:{}] 서버 인증서 검증 실패: {}", self.session_id(), e);
+                }
+                // 에러 발생 시 연결 카운터 감소
+                self.metrics.connection_closed(true);
+                Err(e)
             }
+        }
+    }
+    
+    /// HTTP 요청 로깅
+    async fn log_http_request(&self, host: &str, request_str: &str, target_ip: &str, _session_id: &str) {
+        // 요청 파싱 - 메서드, 경로, 헤더 등
+        let first_line = request_str.lines().next().unwrap_or("");
+        let parts: Vec<&str> = first_line.split_whitespace().collect();
+        
+        let method = parts.get(0).unwrap_or(&"UNKNOWN").to_string();
+        let path = parts.get(1).unwrap_or(&"/").to_string();
+        
+        // 헤더와 본문 분리
+        let mut header = request_str.to_string();
+        let mut body = None;
+        
+        if let Some(header_end) = request_str.find("\r\n\r\n") {
+            header = request_str[..header_end].to_string();
             
-            // 클라이언트 IP 주소 가져오기
-            let client_ip = self.client_addr.ip().to_string();
-            
-            // 로그 저장
-            match logger.log_async(
-                host.to_string(),
-                &method,
-                &path,
-                &headers,
-                body,
-                session_id,
-                &client_ip,
-                target_ip,
-                None,  // 응답 시간은 아직 알 수 없음
-                false,   // 차단되지 않은 요청
-                false    // TLS 아님
-            ) {
-                Ok(_) => info!("[Session:{}] {}HTTP 요청 로깅 성공: {} {}", 
-                             session_id, log_prefix, method, path),
-                Err(e) => error!("[Session:{}] {}HTTP 요청 로깅 실패: {}", 
-                               session_id, log_prefix, e)
+            // 본문 추출 (있는 경우)
+            let body_start = header_end + 4; // "\r\n\r\n" 길이
+            if body_start < request_str.len() {
+                body = Some(request_str[body_start..].to_string());
             }
-        } else {
-            error!("[Session:{}] RequestLogger 인스턴스에 접근할 수 없습니다", session_id);
+        }
+        
+        // 클라이언트 IP 주소
+        let client_ip = self.client_addr.ip().to_string();
+        
+        // Logger 인스턴스 사용 (이제 직접 사용 가능)
+        if let Err(e) = self.logger.log_request(
+            host.to_string(),
+            method,
+            path,
+            header,
+            body,
+            self.session_id.clone(),
+            client_ip,
+            target_ip.to_string(),
+            false, // 차단되지 않음
+            false  // HTTP 요청
+        ).await {
+            error!("[Session:{}] HTTP 요청 로깅 실패: {}", self.session_id(), e);
         }
     }
 

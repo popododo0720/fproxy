@@ -3,17 +3,28 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use log::{debug, error, info};
 use chrono;
+use std::sync::Arc;
 
 use crate::tls::{generate_fake_cert, accept_tls_with_cert};
-use crate::REQUEST_LOGGER;
+use crate::logging::Logger;
 
 /// 차단 페이지 생성 및 전송을 담당하는 구조체
-pub struct BlockPage;
+pub struct BlockPage {
+    logger: Option<Arc<Logger>>,
+}
 
 impl BlockPage {
     /// 새로운 BlockPage 인스턴스 생성
     pub fn new() -> Self {
-        Self {}
+        Self {
+            logger: None,
+        }
+    }
+    
+    /// Logger 설정
+    pub fn with_logger(mut self, logger: Arc<Logger>) -> Self {
+        self.logger = Some(logger);
+        self
     }
     
     /// HTTP 차단 페이지 생성
@@ -110,14 +121,15 @@ impl BlockPage {
     
     /// 차단 요청 로깅
     async fn log_blocked_request(&self, request_data: &str, host: &str, ip: &str, session_id: &str, is_tls: bool) {
-        // 간단하게 try_read()로 돌아가되, 비동기적으로 처리
-        if let Ok(logger) = REQUEST_LOGGER.try_read() {
-            // 요청 파싱 및 로깅
-            // 여기서는 RequestLogger의 parse_request_for_reject 메서드를 사용하는 것이 적절합니다
-            logger.log_rejected_request(request_data, host, ip, session_id, is_tls).await;
-            debug!("[Session:{}] 차단된 요청 로깅 시도 완료", session_id);
+        // Logger 인스턴스 사용 (이제 직접 사용 가능)
+        if let Some(logger) = &self.logger {
+            // 로그 저장 - 비동기 로깅 사용
+            match logger.log_rejected_request(request_data, host, ip, session_id, is_tls).await {
+                Ok(_) => debug!("[Session:{}] 차단된 요청 로깅 성공", session_id),
+                Err(e) => debug!("[Session:{}] 차단된 요청 로깅 실패: {}", session_id, e)
+            }
         } else {
-            debug!("[Session:{}] RequestLogger 읽기 락 획득 실패", session_id);
+            debug!("[Session:{}] Logger가 설정되지 않았습니다", session_id);
         }
     }
     

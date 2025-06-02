@@ -1,3 +1,4 @@
+use std::error::Error;
 use std::sync::Arc;
 use std::io;
 use std::time::Instant;
@@ -12,13 +13,12 @@ use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::server::TlsStream as ServerTlsStream;
 use httparse;
 use memmem::{Searcher, TwoWaySearcher};
-use base64::{self, engine::general_purpose::STANDARD, Engine};
+use base64;
 
 use crate::metrics::Metrics;
 use crate::constants;
 use crate::config::Config;
 use crate::logging::{Logger, LogFormatter};
-use crate::error::{ProxyError, Result, tls_err, internal_err};
 
 // 패턴 상수 정의 - 전역으로 이동하여 매번 생성하지 않도록 함
 const HEADER_END_PATTERN: &[u8] = b"\r\n\r\n";
@@ -160,7 +160,7 @@ pub async fn proxy_tls_streams(
     let parsing_request = Arc::new(RwLock::new(false));
     let current_request_id = Arc::new(RwLock::new(0_u64));
     
-    // 클라이언트 -> 서버 방향 프록시
+    // 바이트 카운터 초기화
     let client_to_server = {
         let request_times = Arc::clone(&request_times);
         let parsing_request = Arc::clone(&parsing_request);
@@ -171,12 +171,11 @@ pub async fn proxy_tls_streams(
         let logger_clone = logger.clone();
         let session_id_str = session_id.to_string();
         let host_str = host.to_string();
-        let config_clone = config.clone(); // config 클론
         
         async move {
             let mut total_bytes = 0u64;
             // config에서 buffer_size 가져오기
-            let buffer_size = config_clone.as_ref()
+            let buffer_size = config.as_ref()
                 .map(|c| c.buffer_size)
                 .unwrap_or(constants::BUFFER_SIZE_MEDIUM);
                 
@@ -186,7 +185,7 @@ pub async fn proxy_tls_streams(
             let header_searcher = TwoWaySearcher::new(HEADER_END_PATTERN);
             
             // 버퍼 재사용을 위한 초기화
-            let mut buffer = BytesMut::with_capacity(constants::BUFFER_SIZE_MEDIUM);
+            let mut buffer = BytesMut::with_capacity(BUFFER_SIZE_MEDIUM);
             
             loop {
                 buffer.clear(); // 버퍼 재사용 
@@ -320,12 +319,11 @@ pub async fn proxy_tls_streams(
         let metrics_clone = Arc::clone(&metrics);
         let session_id_str = session_id.to_string();
         let logger_clone = logger.clone();
-        let config_clone = config.clone(); // config 클론
         
         async move {
             let mut total_bytes = 0u64;
             // config에서 buffer_size 가져오기
-            let buffer_size = config_clone.as_ref()
+            let buffer_size = config.as_ref()
                 .map(|c| c.buffer_size)
                 .unwrap_or(constants::BUFFER_SIZE_MEDIUM);
                 
@@ -337,7 +335,7 @@ pub async fn proxy_tls_streams(
             let chunk_searcher = TwoWaySearcher::new(CHUNK_END_PATTERN);
             
             // 버퍼 재사용을 위한 초기화
-            let mut buffer = BytesMut::with_capacity(constants::BUFFER_SIZE_MEDIUM);
+            let mut buffer = BytesMut::with_capacity(BUFFER_SIZE_MEDIUM);
             
             loop {
                 buffer.clear(); // 버퍼 재사용
@@ -401,7 +399,7 @@ pub async fn proxy_tls_streams(
                                             Some(LogFormatter::summarize_body(body_text, 1024))
                                         } else {
                                             // 바이너리 데이터를 base64로 인코딩
-                                            let base64_data = STANDARD.encode(body_slice);
+                                            let base64_data = base64::encode(body_slice);
                                             Some(LogFormatter::summarize_body(&base64_data, 1024))
                                         }
                                     } else {
