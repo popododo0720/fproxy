@@ -1,18 +1,70 @@
 // 파티션 관련 SQL 쿼리
 
-/// 파티션 관련 상수 정의
-
-/// 파티션 삭제 쿼리
-pub const DROP_PARTITION: &str = "DROP TABLE IF EXISTS $1";
-
-/// 특정 날짜 이전의 파티션 목록 조회 쿼리
-pub const LIST_OLD_PARTITIONS: &str = "
-    SELECT tablename 
-    FROM pg_tables 
-    WHERE schemaname = 'public' 
-    AND tablename LIKE $1 || '_%'
-    AND tablename < $1 || '_' || $2
+/// 현재 및 미래 파티션 자동 생성 스크립트 (파라미터화된 버전)
+pub const CREATE_FUTURE_PARTITIONS_TEMPLATE: &str = "
+DO $$
+DECLARE
+    current_date DATE := CURRENT_DATE;
+    future_date DATE;
+    partition_name TEXT;
+    table_prefix TEXT := '%s';
+    days_ahead INTEGER := %d;
+BEGIN
+    FOR i IN 0..days_ahead LOOP
+        future_date := current_date + (i * INTERVAL '1 day');
+        partition_name := table_prefix || '_' || TO_CHAR(future_date, 'YYYYMMDD');
+        
+        EXECUTE 'CREATE TABLE IF NOT EXISTS ' || partition_name || 
+                ' PARTITION OF ' || table_prefix || 
+                ' FOR VALUES FROM (''' || future_date || 
+                ''') TO (''' || (future_date + INTERVAL '1 day') || ''')';
+        
+        RAISE NOTICE 'Created partition: %%', partition_name;
+    END LOOP;
+END $$;
 ";
 
-/// 월별 파티션 생성 쿼리
-pub const CREATE_MONTHLY_PARTITION: &str = "CREATE TABLE IF NOT EXISTS {} PARTITION OF {} FOR VALUES FROM ('{}') TO ('{}')"; 
+/// 월간 파티션 자동 생성 스크립트 (파라미터화된 버전)
+pub const CREATE_MONTHLY_PARTITIONS_TEMPLATE: &str = "
+DO $$
+DECLARE
+    current_month DATE := DATE_TRUNC('month', CURRENT_DATE);
+    future_month DATE;
+    partition_name TEXT;
+    table_prefix TEXT := '%s';
+    months_ahead INTEGER := %d;
+BEGIN
+    FOR i IN 0..months_ahead LOOP
+        future_month := current_month + (i * INTERVAL '1 month');
+        partition_name := table_prefix || '_' || TO_CHAR(future_month, 'YYYYMM');
+        
+        EXECUTE 'CREATE TABLE IF NOT EXISTS ' || partition_name || 
+                ' PARTITION OF ' || table_prefix || 
+                ' FOR VALUES FROM (''' || future_month || 
+                ''') TO (''' || (future_month + INTERVAL '1 month') || ''')';
+        
+        RAISE NOTICE 'Created monthly partition: %%', partition_name;
+    END LOOP;
+END $$;
+";
+
+/// 오래된 파티션 정리 스크립트 (파라미터화된 버전)
+pub const DROP_OLD_PARTITIONS_TEMPLATE: &str = "
+DO $$
+DECLARE
+    cutoff_date DATE := CURRENT_DATE - (%d * INTERVAL '1 day');
+    cutoff_str TEXT := TO_CHAR(cutoff_date, 'YYYYMMDD');
+    table_prefix TEXT := '%s';
+    rec RECORD;
+BEGIN
+    FOR rec IN SELECT tablename 
+               FROM pg_tables 
+               WHERE schemaname = 'public' 
+               AND tablename LIKE table_prefix || '_%%'
+               AND tablename < CONCAT(table_prefix, '_', cutoff_str)
+    LOOP
+        EXECUTE 'DROP TABLE IF EXISTS ' || rec.tablename;
+        RAISE NOTICE 'Dropped old partition: %%', rec.tablename;
+    END LOOP;
+END $$;
+"; 

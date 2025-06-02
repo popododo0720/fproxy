@@ -1,10 +1,10 @@
 use std::error::Error;
 use std::sync::Arc;
-use log::trace;
+use log::debug;
 use tokio_postgres::Row;
 use tokio_postgres::types::ToSql;
 
-use super::pool::{get_db_pool, DatabasePool};
+use crate::db::pool::{DatabasePool, get_db_pool};
 
 /// 쿼리 실행기 구조체
 pub struct QueryExecutor {
@@ -23,6 +23,15 @@ impl QueryExecutor {
         Self::new().await
     }
     
+    /// DB 클라이언트 가져오기
+    pub async fn get_client(&self) -> Result<deadpool_postgres::Client, Box<dyn Error + Send + Sync>> {
+        // 풀에서 클라이언트 객체 가져오기
+        let pool_client = self.pool.get_client().await?;
+        
+        // deadpool 클라이언트를 반환
+        Ok(pool_client)
+    }
+    
     /// 단일 쿼리 실행
     pub async fn execute_query(
         &self,
@@ -31,7 +40,7 @@ impl QueryExecutor {
     ) -> Result<u64, Box<dyn Error + Send + Sync>> {
         let client = self.pool.get_client().await?;
         
-        trace!("쿼리 실행: {}", query);
+        debug!("쿼리 실행: {}", query);
         let result = client.execute(query, params).await?;
         
         Ok(result)
@@ -49,13 +58,13 @@ impl QueryExecutor {
     {
         let client = self.pool.get_client().await?;
         
-        trace!("단일 행 쿼리 실행: {}", query);
+        debug!("단일 행 쿼리 실행: {}", query);
         let row = client.query_one(query, params).await?;
         
         row_mapper(row)
     }
     
-    /// 여러 행 쿼리 실행 후 결과 벡터 반환
+    /// 여러 행 쿼리 실행
     pub async fn query_rows<T, F>(
         &self,
         query: &str,
@@ -67,7 +76,7 @@ impl QueryExecutor {
     {
         let client = self.pool.get_client().await?;
         
-        trace!("다중 행 쿼리 실행: {}", query);
+        debug!("다중 행 쿼리 실행: {}", query);
         let rows = client.query(query, params).await?;
         
         let mut results = Vec::with_capacity(rows.len());
@@ -77,4 +86,4 @@ impl QueryExecutor {
         
         Ok(results)
     }
-} 
+}

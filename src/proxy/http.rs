@@ -1,650 +1,455 @@
+use std::sync::Arc;
+use std::time::{Instant, Duration};
 use std::error::Error;
-use std::sync::{Arc};
-use std::io;
-use std::time::Instant;
-use std::collections::HashMap;
 
-use log::{debug, error, info, warn};
+use log::{debug, error, warn};
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::RwLock;
 use bytes::{BytesMut, BufMut};
-use httparse;
-use memmem::{Searcher, TwoWaySearcher};
+use base64::{self, engine::general_purpose::STANDARD, Engine};
 
 use crate::metrics::Metrics;
-use crate::constants::*;
-use crate::REQUEST_LOGGER;
+use crate::config::Config;
+use crate::logging::{Logger, LogFormatter};
 
-/// HTTP 응답이 완료되었는지 확인하는 함수
-fn is_response_complete(
-    resp_bytes: &[u8], 
-    headers_end_pos: usize, 
-    chunk_searcher: &TwoWaySearcher
-) -> (bool, Option<usize>, bool) {
-    // 헤더 파싱
-    let mut headers = [httparse::EMPTY_HEADER; 64];
-    let mut resp = httparse::Response::new(&mut headers);
-    
-    if let Ok(_) = resp.parse(&resp_bytes[..headers_end_pos]) {
-        // Content-Length 또는 Transfer-Encoding 찾기
-        let mut content_length = None;
-        let mut is_chunked = false;
-        
-        for header in headers.iter() {
-            if header.name.is_empty() {
-                break;
-            }
-            
-            if header.name.eq_ignore_ascii_case("content-length") {
-                if let Ok(len_str) = std::str::from_utf8(header.value) {
-                    if let Ok(len) = len_str.trim().parse::<usize>() {
-                        content_length = Some(len);
-                    }
-                }
-            } else if header.name.eq_ignore_ascii_case("transfer-encoding") {
-                if let Ok(value) = std::str::from_utf8(header.value) {
-                    is_chunked = value.to_lowercase().contains("chunked");
+// 기본 상수 정의 (config에서 값을 가져오지 못할 경우 사용)
+const DEFAULT_BUFFER_SIZE: usize = 8192;
+const DEFAULT_PROXY_TIMEOUT_MS: u64 = 30000; // 30초
+
+/// HTTP 요청 헤더 끝 위치 찾기
+fn find_header_end(buffer: &[u8]) -> Option<usize> {
+    // \r\n\r\n 패턴 찾기
+    for i in 0..buffer.len().saturating_sub(3) {
+        if buffer[i] == b'\r' && buffer[i+1] == b'\n' && buffer[i+2] == b'\r' && buffer[i+3] == b'\n' {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// 헤더에서 Content-Length 값 추출
+fn extract_content_length(headers: &str) -> Option<usize> {
+    for line in headers.lines() {
+        if line.to_lowercase().starts_with("content-length:") {
+            if let Some(length_str) = line.split(':').nth(1) {
+                if let Ok(length) = length_str.trim().parse::<usize>() {
+                    return Some(length);
                 }
             }
         }
-        
-        // 응답 완료 확인
-        if is_chunked {
-            // chunked 인코딩의 경우 마지막 청크 패턴 확인
-            let is_complete = chunk_searcher.search_in(resp_bytes).is_some();
-            return (is_complete, None, true);
-        } else if let Some(len) = content_length {
-            // Content-Length가 있는 경우, 헤더 끝 이후의 본문 길이 확인
-            let body_length = resp_bytes.len() - headers_end_pos;
-            return (body_length >= len, Some(len), false);
-        } else {
-            // Content-Length도 없고 chunked도 아닌 경우, 헤더 수신 후 즉시 응답 완료로 처리
-            return (true, None, false);
+    }
+    None
+}
+
+/// HTTP 응답 상태 코드 추출
+fn extract_status_code(headers: &str) -> Option<u16> {
+    let first_line = headers.lines().next()?;
+    let parts: Vec<&str> = first_line.split_whitespace().collect();
+    if parts.len() >= 2 {
+        parts[1].parse::<u16>().ok()
+    } else {
+        None
+    }
+}
+
+/// HTTP 요청에서 기본 정보 추출 (메서드, 경로, 호스트, 헤더 끝 위치)
+fn parse_http_request_basic(request: &str) -> (String, String, Option<String>, Option<usize>) {
+    let mut method = String::from("UNKNOWN");
+    let mut path = String::from("/");
+    let mut host = None;
+    let mut header_end = None;
+    
+    // 요청 라인 파싱
+    if let Some(first_line) = request.lines().next() {
+        let parts: Vec<&str> = first_line.split_whitespace().collect();
+        if parts.len() >= 2 {
+            method = parts[0].to_string();
+            path = parts[1].to_string();
         }
     }
     
-    (false, None, false)
+    // 호스트 헤더 찾기
+    for line in request.lines() {
+        if line.is_empty() {
+            break;
+        }
+        
+        if line.to_lowercase().starts_with("host:") {
+            if let Some(h) = line.splitn(2, ':').nth(1) {
+                host = Some(h.trim().to_string());
+            }
+        }
+    }
+    
+    // 헤더 끝 위치 찾기
+    if let Some(pos) = request.find("\r\n\r\n") {
+        header_end = Some(pos);
+    }
+    
+    (method, path, host, header_end)
 }
 
-/// HTTP 스트림 간에 데이터를 전달하고 검사합니다
+/// 간소화된 HTTP 프록시 함수
 pub async fn proxy_http_streams(
-    client_stream: TcpStream,
-    server_stream: TcpStream,
+    mut client_stream: TcpStream,
+    mut server_stream: TcpStream,
     metrics: Arc<Metrics>,
     session_id: &str,
     request_start_time: Instant,
+    config: Option<Arc<Config>>,
+    initial_request: Option<Vec<u8>>,
+    already_logged: bool,
+    logger: Option<Arc<Logger>>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    // 클라이언트 IP 주소 가져오기
-    let client_ip = client_stream.peer_addr()
-        .map(|addr| addr.ip().to_string())
-        .unwrap_or_else(|_| "Unknown IP".to_string());
+    // 세션 ID를 문자열로 복제하여 일관된 사용 보장
+    let session_id_str = session_id.to_string();
     
-    // 서버 IP 주소 가져오기
-    let server_ip = server_stream.peer_addr()
-        .map(|addr| addr.ip().to_string())
-        .unwrap_or_else(|_| "Unknown IP".to_string());
+    // config에서 buffer_size 가져오기
+    let buffer_size = config.as_ref()
+        .map(|c| c.buffer_size)
+        .unwrap_or(DEFAULT_BUFFER_SIZE);
     
-    // HTTP는 항상 표준 터널링 모드 사용 (splice 사용 안 함)
-    debug!("[Session:{}] Using standard mode for HTTP streams", session_id);
+    // 버퍼 초기화
+    let mut client_buf = BytesMut::with_capacity(buffer_size);
+    let mut server_buf = BytesMut::with_capacity(buffer_size);
+    
+    // 초기 요청이 있으면 서버로 전송
+    if let Some(initial_data) = initial_request {
+        // 초기 요청 데이터 복사
+        client_buf.put_slice(&initial_data);
+        
+        // 요청 로깅 (아직 로깅되지 않은 경우)
+        if !already_logged {
+            // 요청 텍스트 변환
+            let request_text = String::from_utf8_lossy(&client_buf).to_string();
+            
+            // 기본 요청 정보 파싱
+            let (method, path, host_opt, _) = parse_http_request_basic(&request_text);
+            let host = host_opt.unwrap_or_else(|| "unknown.host".to_string());
+            
+            // 로거가 있으면 요청 로깅
+            if let Some(logger) = &logger {
+                if let Err(e) = logger.log_request(
+                    host.clone(),
+                    method,
+                    path,
+                    request_text,
+                    None, // body
+                    session_id_str.clone(),
+                    "0.0.0.0".to_string(), // client_ip
+                    "0.0.0.0".to_string(), // target_ip
+                    false, // is_rejected
+                    false, // is_tls
+                ).await {
+                    error!("[Session:{}] 요청 로깅 실패: {}", session_id_str, e);
+                }
+            }
+        }
+        
+        // 서버로 전송
+        if let Err(e) = server_stream.write_all(&client_buf).await {
+            error!("[Session:{}] 서버에 초기 요청 전송 실패: {}", session_id_str, e);
+            return Err(Box::new(e));
+        }
+        
+        // 버퍼 비우기
+        client_buf.clear();
+    }
+    
+    // config에서 timeout_ms 가져오기
+    let timeout_ms = config.as_ref()
+        .map(|c| c.timeout_ms as u64)
+        .unwrap_or(DEFAULT_PROXY_TIMEOUT_MS);
+    
+    // 타임아웃 설정
+    let timeout_duration = Duration::from_millis(timeout_ms);
+    
+    // 완료 플래그
+    let mut _is_complete = false;
+    
+    // 헤더 끝 위치
+    let mut header_end_pos = None;
+    
+    // 응답 완료 감지를 위한 변수
+    let mut content_length: Option<usize> = None;
+    let mut is_chunked = false;
+    let mut received_bytes = 0;
+    let mut chunked_complete = false;
+    
+    // 서버로부터 응답 읽기
+    loop {
+        // 타임아웃 설정
+        match tokio::time::timeout(timeout_duration, server_stream.read_buf(&mut server_buf)).await {
+            Ok(result) => {
+                match result {
+                    Ok(0) => {
+                        // 서버가 연결을 닫음
+                        debug!("[Session:{}] 서버가 연결을 닫음", session_id_str);
+                        break;
+                    }
+                    Ok(n) => {
+                        debug!("[Session:{}] 서버로부터 {}바이트 수신", session_id_str, n);
+                        
+                        // 헤더 끝 위치를 아직 찾지 못했다면 찾기
+                        if header_end_pos.is_none() {
+                            if let Some(pos) = find_header_end(&server_buf) {
+                                header_end_pos = Some(pos);
+                                
+                                // 헤더를 찾았으면 Content-Length 또는 Transfer-Encoding: chunked 확인
+                                let headers = String::from_utf8_lossy(&server_buf[..pos]).to_string();
+                                
+                                // Content-Length 확인
+                                if let Some(length) = extract_content_length(&headers) {
+                                    content_length = Some(length);
+                                    debug!("[Session:{}] Content-Length: {}", session_id_str, length);
+                                }
+                                
+                                // Transfer-Encoding: chunked 확인
+                                if headers.to_lowercase().contains("transfer-encoding: chunked") {
+                                    is_chunked = true;
+                                    debug!("[Session:{}] Chunked encoding detected", session_id_str);
+                                }
+                            }
+                        }
+                        
+                        // 클라이언트에 전송
+                        if let Err(e) = client_stream.write_all(&server_buf[server_buf.len() - n..]).await {
+                            error!("[Session:{}] 클라이언트에 응답 전송 실패: {}", session_id_str, e);
+                            return Err(Box::new(e));
+                        }
+                        
+                        // 응답 완료 감지 로직
+                        if let Some(pos) = header_end_pos {
+                            if let Some(length) = content_length {
+                                // Content-Length 기반 완료 감지
+                                received_bytes += n;
+                                let body_received = server_buf.len() - pos - 4; // 헤더 끝 패턴(\r\n\r\n) 길이 4 빼기
+                                
+                                if body_received >= length {
+                                    debug!("[Session:{}] 응답 완료 감지: Content-Length 기반 ({}바이트)", session_id_str, body_received);
+                                    _is_complete = true;
+                                    break;
+                                }
+                            } else if is_chunked {
+                                // Chunked 인코딩 기반 완료 감지
+                                // 마지막 청크(0 크기 청크)를 찾음
+                                let buf_str = String::from_utf8_lossy(&server_buf).to_string();
+                                if buf_str.contains("\r\n0\r\n\r\n") {
+                                    debug!("[Session:{}] 응답 완료 감지: Chunked 인코딩 종료 마커 발견", session_id_str);
+                                    chunked_complete = true;
+                                    _is_complete = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("[Session:{}] 서버로부터 읽기 오류: {}", session_id_str, e);
+                        return Err(Box::new(e));
+                    }
+                }
+            }
+            Err(_) => {
+                warn!("[Session:{}] 서버 읽기 타임아웃, 정상 종료로 처리", session_id_str);
+                _is_complete = true;
+                break;
+            }
+        }
+    }
+    
+    // 응답 시간 계산
+    let response_time = request_start_time.elapsed().as_millis() as u64;
+    
+    // 응답 로깅
+    if let Some(logger) = &logger {
+        // 헤더 추출
+        let headers = if let Some(pos) = header_end_pos {
+            if let Ok(headers_text) = std::str::from_utf8(&server_buf[..pos]) {
+                headers_text.to_string()
+            } else {
+                String::from_utf8_lossy(&server_buf[..pos]).into_owned()
+            }
+        } else {
+            // 헤더 끝을 찾지 못한 경우 전체 버퍼를 사용
+            String::from_utf8_lossy(&server_buf).into_owned()
+        };
+        
+        // 응답 본문 미리보기 (최대 1KB)
+        let body_preview = if let Some(pos) = header_end_pos {
+            if server_buf.len() > pos + 4 {
+                let preview_end = std::cmp::min(pos + 4 + 1024, server_buf.len());
+                let body_slice = &server_buf[pos + 4..preview_end];
+                
+                if let Ok(body_text) = std::str::from_utf8(body_slice) {
+                    Some(LogFormatter::summarize_body(body_text, 1024))
+                } else {
+                    // 바이너리 데이터를 base64로 인코딩
+                    let base64_data = STANDARD.encode(body_slice);
+                    Some(LogFormatter::summarize_body(&base64_data, 1024))
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        
+        // 응답 로그 저장
+        if let Err(e) = logger.log_response(
+            session_id_str.clone(),
+            extract_status_code(&headers).unwrap_or(0),
+            response_time,
+            server_buf.len(), // response_size
+            headers,
+            body_preview,
+        ).await {
+            error!("[Session:{}] 응답 로깅 실패: {}", session_id_str, e);
+        }
+    }
+    
+    // 세션 완료 로깅
+    debug!("[Session:{}] HTTP 세션 완료: {} ms", session_id_str, response_time);
+    
+    Ok(())
+}
+
+/// 클라이언트와 서버 간 양방향 HTTP 프록시
+pub async fn bidirectional_http_proxy(
+    mut client_stream: TcpStream,
+    mut server_stream: TcpStream,
+    _metrics: Arc<Metrics>,
+    session_id: &str,
+    config: Option<Arc<Config>>,
+    logger: Option<Arc<Logger>>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    // 세션 ID를 문자열로 복제하여 일관된 사용 보장
+    let session_id_str = session_id.to_string();
+    
+    // config에서 buffer_size 가져오기
+    let buffer_size = config.as_ref()
+        .map(|c| c.buffer_size)
+        .unwrap_or(DEFAULT_BUFFER_SIZE);
+    
+    // 버퍼 초기화
+    let mut client_buf = BytesMut::with_capacity(buffer_size);
+    
+    // 요청 시작 시간
+    let _request_start_time = Instant::now();
+    
+    // config에서 timeout_ms 가져오기
+    let timeout_ms = config.as_ref()
+        .map(|c| c.timeout_ms as u64)
+        .unwrap_or(DEFAULT_PROXY_TIMEOUT_MS);
+    
+    // 타임아웃 설정
+    let timeout_duration = Duration::from_millis(timeout_ms);
+    
+    // 완료 플래그
+    let mut _is_complete = false;
+    
+    // 클라이언트로부터 초기 요청 읽기
+    match tokio::time::timeout(timeout_duration, client_stream.read_buf(&mut client_buf)).await {
+        Ok(result) => {
+            match result {
+                Ok(0) => {
+                    debug!("[Session:{}] 클라이언트가 연결을 닫음", session_id_str);
+                    return Ok(());
+                }
+                Ok(n) => {
+                    debug!("[Session:{}] 클라이언트로부터 {}바이트 수신", session_id_str, n);
+                    
+                    // 요청 텍스트 변환
+                    let request_text = String::from_utf8_lossy(&client_buf).to_string();
+                    
+                    // 기본 요청 정보 파싱
+                    let (method, path, host_opt, _) = parse_http_request_basic(&request_text);
+                    let host = host_opt.unwrap_or_else(|| "unknown.host".to_string());
+                    
+                    // 로거가 있으면 요청 로깅
+                    if let Some(logger) = &logger {
+                        if let Err(e) = logger.log_request(
+                            host.clone(),
+                            method,
+                            path,
+                            request_text,
+                            None, // body
+                            session_id_str.clone(),
+                            "0.0.0.0".to_string(), // client_ip
+                            "0.0.0.0".to_string(), // target_ip
+                            false, // is_rejected
+                            false, // is_tls
+                        ).await {
+                            error!("[Session:{}] 요청 로깅 실패: {}", session_id_str, e);
+                        }
+                    }
+                    
+                    // 서버로 전송
+                    if let Err(e) = server_stream.write_all(&client_buf).await {
+                        error!("[Session:{}] 서버에 요청 전송 실패: {}", session_id_str, e);
+                        return Err(Box::new(e));
+                    }
+                }
+                Err(e) => {
+                    error!("[Session:{}] 클라이언트로부터 읽기 오류: {}", session_id_str, e);
+                    return Err(Box::new(e));
+                }
+            }
+        }
+        Err(_) => {
+            warn!("[Session:{}] 클라이언트 읽기 타임아웃", session_id_str);
+            return Ok(());
+        }
+    }
+    
+    // 양방향 프록시 시작
     let (mut client_read, mut client_write) = tokio::io::split(client_stream);
     let (mut server_read, mut server_write) = tokio::io::split(server_stream);
     
-    // 개별 요청 시작 시간 추적을 위한 HashMap - tokio::sync::RwLock 사용
-    let request_times: Arc<RwLock<HashMap<u64, Instant>>> = Arc::new(RwLock::new(HashMap::new()));
-    
-    // HTTP 요청 감지 상태 - tokio::sync::RwLock 사용
-    let parsing_request = Arc::new(RwLock::new(false));
-    let current_request_id = Arc::new(RwLock::new(0_u64));
-    
-    // 패턴 상수 정의
-    let header_end = b"\r\n\r\n";
-    let chunk_end = b"\r\n0\r\n\r\n";
-    
-    // 양방향 데이터 전송 설정
-    let client_to_server = {
-        let request_times: Arc<RwLock<HashMap<u64, Instant>>> = Arc::clone(&request_times);
-        let parsing_request = Arc::clone(&parsing_request);
-        let current_request_id = Arc::clone(&current_request_id);
-        let metrics_clone = Arc::clone(&metrics);
-        
-        async move {
-            let mut total_bytes = 0u64;
-            let mut req_buffer = BytesMut::with_capacity(BUFFER_SIZE_SMALL);
-            let header_searcher = TwoWaySearcher::new(header_end);
-            
-            loop {
-                let mut buffer = BytesMut::with_capacity(BUFFER_SIZE_SMALL);
-                
-                match client_read.read_buf(&mut buffer).await {
-                    Ok(0) => break, // 연결 종료
-                    Ok(n) => {
-                        // HTTP 요청 감지 및 파싱 - 해당 부분을 더 효율적으로 구현
-                        if !*parsing_request.read().await && !buffer.is_empty() {
-                            let mut headers = [httparse::EMPTY_HEADER; 64];
-                            let mut req = httparse::Request::new(&mut headers);
-                            
-                            if let Ok(status) = req.parse(&buffer) {
-                                if status.is_partial() || status.is_complete() {
-                                    if let Some(method) = req.method {
-                                        if method == "GET" || method == "POST" || method == "PUT" || 
-                                           method == "DELETE" || method == "HEAD" || method == "OPTIONS" {
-                                            let mut req_id = current_request_id.write().await;
-                                            *req_id += 1;
-                                            let request_id = *req_id;
-                                            
-                                            // 요청 시간 기록 - 이 시점에서 요청이 시작된 것으로 간주
-                                            request_times.write().await.insert(request_id, Instant::now());
-                                            *parsing_request.write().await = true;
-                                            
-                                            // 요청 정보 로깅 (디버그용)
-                                            let path = req.path.unwrap_or("");
-                                            debug!("[Session:{}] 새 HTTP 요청 #{} 감지: {} {}", 
-                                                  session_id, request_id, method, path);
-                                            
-                                            // 호스트 헤더 추출
-                                            let host = headers.iter()
-                                                .find(|h| h.name.eq_ignore_ascii_case("Host"))
-                                                .and_then(|h| std::str::from_utf8(h.value).ok())
-                                                .unwrap_or("unknown_host");
-                                            
-                                            // DB에 요청 로깅
-                                            if let Ok(logger) = REQUEST_LOGGER.try_read() {
-                                                let headers_str = buffer.iter().map(|&c| c as char).collect::<String>();
-                                                
-                                                if let Err(e) = logger.log_async(
-                                                    host,
-                                                    method,
-                                                    path,
-                                                    &headers_str,
-                                                    None, // 바디는 나중에 처리
-                                                    session_id,
-                                                    &client_ip, // 클라이언트 IP 추가
-                                                    &server_ip, // 서버 IP 추가
-                                                    None,
-                                                    false,
-                                                    false // HTTP는 TLS가 아님
-                                                ) {
-                                                    warn!("[Session:{}] HTTP 요청 로깅 실패: {}", session_id, e);
-                                                } else {
-                                                    info!("[Session:{}] HTTP 요청 로깅 성공: {} {}", session_id, method, path);
-                                                }
-                                            }
-                                            
-                                            req_buffer.clear();
-                                            req_buffer.put_slice(&buffer);
-
-                                            // 요청 헤더 끝 확인
-                                            if header_searcher.search_in(&buffer).is_some() {
-                                                debug!("[Session:{}] HTTP 요청 #{} 헤더 완료", session_id, request_id);
-                                                
-                                                // Content-Length 확인
-                                                let mut has_body = false;
-                                                for header in headers.iter() {
-                                                    if header.name.is_empty() {
-                                                        break;
-                                                    }
-                                                    
-                                                    if header.name.eq_ignore_ascii_case("content-length") {
-                                                        if let Ok(len_str) = std::str::from_utf8(header.value) {
-                                                            if let Ok(len) = len_str.trim().parse::<usize>() {
-                                                                if len > 0 {
-                                                                    has_body = true;
-                                                                    debug!("[Session:{}] HTTP 요청 #{} 본문 있음 ({}바이트)", 
-                                                                          session_id, request_id, len);
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                
-                                                // GET/HEAD 요청이거나 본문이 없는 요청은 이 시점에서 완료된 것으로 간주
-                                                if method == "GET" || method == "HEAD" || !has_body {
-                                                    debug!("[Session:{}] HTTP 요청 #{} 완료 (본문 없음)", session_id, request_id);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        } else if *parsing_request.read().await {
-                            req_buffer.put_slice(&buffer);
-                            
-                            // 최적화된 패턴 검색 - 고정 크기 패턴에 대해 memmem 라이브러리 활용
-                            if header_searcher.search_in(req_buffer.as_ref()).is_some() {
-                                debug!("[Session:{}] HTTP 요청 헤더 완료", session_id);
-                            }
-                        }
-                        
-                        // 제로 카피 전송 구현
-                        // 바이트 슬라이스를 직접 전송
-                        let bytes = buffer.freeze();
-                        if let Err(e) = server_write.write_all(&bytes).await {
-                            error!("[Session:{}] Failed to write to server: {}", session_id, e);
-                            break;
-                        }
-                        
-                        // 메트릭스 업데이트 (실시간)
-                        total_bytes += n as u64;
-                        metrics_clone.add_http_bytes_in(n as u64);
-                    },
-                    Err(e) => {
-                        error!("[Session:{}] Error reading from client: {}", session_id, e);
+    // 클라이언트 -> 서버 방향 프록시
+    let client_to_server = tokio::spawn(async move {
+        let mut buffer = BytesMut::with_capacity(buffer_size);
+        loop {
+            match client_read.read_buf(&mut buffer).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    if let Err(e) = server_write.write_all(&buffer[buffer.len() - n..]).await {
+                        error!("서버에 데이터 전송 실패: {}", e);
                         break;
                     }
                 }
+                Err(e) => {
+                    error!("클라이언트로부터 읽기 오류: {}", e);
+                    break;
+                }
             }
-            
-            debug!("[Session:{}] Client to server transfer finished: {} bytes", session_id, total_bytes);
-            Ok::<u64, io::Error>(total_bytes)
         }
-    };
+    });
     
-    let server_to_client = {
-        let request_times: Arc<RwLock<HashMap<u64, Instant>>> = Arc::clone(&request_times);
-        let parsing_request = Arc::clone(&parsing_request);
-        let current_request_id = Arc::clone(&current_request_id);
-        let metrics_clone = Arc::clone(&metrics);
-        
-        async move {
-            let mut total_bytes = 0u64;
-            // 초기에는 중형 버퍼로 시작
-            let mut resp_buffer = BytesMut::with_capacity(BUFFER_SIZE_MEDIUM);
-            let mut is_reading_response = false;
-            let mut current_response_for = 0_u64;
-            let header_searcher = TwoWaySearcher::new(header_end);
-            let chunk_searcher = TwoWaySearcher::new(chunk_end);
-            
-            loop {
-                let mut buffer = BytesMut::with_capacity(BUFFER_SIZE_SMALL);
-                
-                match server_read.read_buf(&mut buffer).await {
-                    Ok(0) => {
-                        // 연결 종료 - 현재 진행 중인 응답이 있으면 완료로 처리
-                        if is_reading_response {
-                            debug!("[Session:{}] 서버 연결 종료로 응답 완료 처리, 요청 #{}", session_id, current_response_for);
-                            
-                            // 응답 시간 측정 및 기록
-                            let duration_ms = {
-                                let mut times = request_times.write().await;
-                                if let Some(start_time) = times.remove(&current_response_for) {
-                                    let duration = start_time.elapsed();
-                                    Some(duration.as_millis() as u64)
-                                } else {
-                                    None
-                                }
-                            };
-                            
-                            if let Some(duration_ms) = duration_ms {
-                                if let Ok(logger) = REQUEST_LOGGER.try_read() {
-                                    info!("[Session:{}] 연결 종료로 인한 HTTP 응답 완료, 요청 #{}, 응답 시간: {}ms", 
-                                          session_id, current_response_for, duration_ms);
-                                    
-                                    // 세션 ID 복사 및 별도 태스크로 실행하여 블로킹 방지
-                                    let session_id_str = session_id.to_string();
-                                    let duration_ms_copy = duration_ms;
-                                    tokio::spawn(async move {
-                                        match logger.update_response_time(&session_id_str, duration_ms_copy).await {
-                                            Ok(_) => info!("[Session:{}] 연결 종료 시 응답 시간 업데이트 성공: {}ms", session_id_str, duration_ms_copy),
-                                            Err(e) => warn!("[Session:{}] 연결 종료 시 응답 시간 업데이트 실패: {}", session_id_str, e)
-                                        }
-                                    });
-                                }
-                            } else {
-                                warn!("[Session:{}] 연결 종료 시 요청 #{} 시작 시간을 찾을 수 없음", session_id, current_response_for);
-                            }
-                        } else {
-                            debug!("[Session:{}] 서버 연결 종료, 진행 중인 응답 없음", session_id);
-                        }
-                        break; // 연결 종료
-                    },
-                    Ok(n) => {
-                        // 클라이언트로 데이터 전송 - 제로 카피로 구현
-                        let buffer_clone = buffer.clone(); // 먼저 복제
-                        let bytes = buffer.freeze(); // 그 다음 freeze
-                        
-                        // 클라이언트에게 데이터 전송 (원본 데이터)
-                        if let Err(e) = client_write.write_all(&bytes).await {
-                            error!("[Session:{}] Failed to write to client: {}", session_id, e);
-                            break;
-                        }
-                        
-                        // 메트릭스 업데이트 (실시간)
-                        total_bytes += n as u64;
-                        metrics_clone.add_http_bytes_out(n as u64);
-                        
-                        // HTTP 응답 감지 및 처리 - 복제된 버퍼 사용
-                        if !is_reading_response {
-                            // 새로운 응답 감지
-                            let mut headers = [httparse::EMPTY_HEADER; 64];
-                            let mut resp = httparse::Response::new(&mut headers);
-                            
-                            if let Ok(status) = resp.parse(&buffer_clone) {
-                                if status.is_partial() || status.is_complete() {
-                                    is_reading_response = true;
-                                    resp_buffer.clear();
-                                    resp_buffer.put_slice(&buffer_clone); // 복제된 버퍼 사용
-                                    
-                                    // 현재 처리 중인 요청 ID 가져오기
-                                    current_response_for = *current_request_id.read().await;
-                                    
-                                    // 응답 상태 코드 로깅
-                                    let status_code = resp.code.unwrap_or(0);
-                                    info!("[Session:{}] HTTP 응답 감지, 요청 #{}, 상태 코드: {}, 버퍼 크기: {}바이트", 
-                                          session_id, current_response_for, status_code, buffer_clone.len());
-                                    
-                                    // 요청 ID가 0이면 강제로 1로 설정 (첫 번째 요청)
-                                    if current_response_for == 0 {
-                                        current_response_for = 1;
-                                        // 요청 시간 기록 (첫 요청인 경우)
-                                        request_times.write().await.insert(current_response_for, Instant::now());
-                                        info!("[Session:{}] 요청 ID가 0이어서 1로 설정하고 시간 기록", session_id);
-                                    }
-                                    
-                                    // 헤더 끝 위치 찾기
-                                    if let Some(headers_end_pos) = header_searcher.search_in(&buffer_clone) {
-                                        let headers_end_pos = headers_end_pos + 4; // \r\n\r\n 길이 포함
-                                        info!("[Session:{}] HTTP 헤더 끝 위치: {}, 총 버퍼 크기: {}", 
-                                              session_id, headers_end_pos, buffer_clone.len());
-                                        
-                                        // 본문이 없는 응답인 경우 즉시 완료로 처리
-                                        if status_code == 204 || status_code == 304 || 
-                                           (status_code >= 100 && status_code < 200) || 
-                                           headers_end_pos == buffer_clone.len() {
-                                            
-                                            // 응답 시간 측정 및 기록 - 락 범위를 최소화
-                                            let duration_ms = {
-                                                let mut times = request_times.write().await;
-                                                if let Some(start_time) = times.remove(&current_response_for) {
-                                                    let duration = start_time.elapsed();
-                                                    Some(duration.as_millis() as u64)
-                                                } else {
-                                                    None
-                                                }
-                                            };
-                                            
-                                            if let Some(duration_ms) = duration_ms {
-                                                info!("[Session:{}] 헤더만 있는 HTTP 응답 즉시 완료 처리, 요청 #{}, 응답 시간: {}ms", 
-                                                      session_id, current_response_for, duration_ms);
-                                                
-                                                // 응답 시간 업데이트 함수 직접 호출
-                                                if let Ok(logger) = REQUEST_LOGGER.try_read() {
-                                                    let session_id_str = session_id.to_string();
-                                                    let duration_ms_copy = duration_ms;
-                                                    tokio::spawn(async move {
-                                                        match logger.update_response_time(&session_id_str, duration_ms_copy).await {
-                                                            Ok(_) => info!("[Session:{}] 헤더 응답 시간 업데이트 성공: {}ms", session_id_str, duration_ms_copy),
-                                                            Err(e) => warn!("[Session:{}] 헤더 응답 시간 업데이트 실패: {}", session_id_str, e)
-                                                        }
-                                                    });
-                                                }
-                                                
-                                                // 요청 파싱 상태 초기화
-                                                {
-                                                    let mut parsing = parsing_request.write().await;
-                                                    *parsing = false;
-                                                }
-                                                
-                                                is_reading_response = false;
-                                            }
-                                        } else {
-                                            // Content-Length 또는 Transfer-Encoding 확인
-                                            let mut content_length = None;
-                                            let mut is_chunked = false;
-                                            
-                                            for header in headers.iter() {
-                                                if header.name.is_empty() {
-                                                    break;
-                                                }
-                                                
-                                                if header.name.eq_ignore_ascii_case("content-length") {
-                                                    if let Ok(len_str) = std::str::from_utf8(header.value) {
-                                                        if let Ok(len) = len_str.trim().parse::<usize>() {
-                                                            content_length = Some(len);
-                                                            info!("[Session:{}] HTTP 응답에 Content-Length: {} 감지", 
-                                                                  session_id, len);
-                                                        }
-                                                    }
-                                                } else if header.name.eq_ignore_ascii_case("transfer-encoding") {
-                                                    if let Ok(value) = std::str::from_utf8(header.value) {
-                                                        is_chunked = value.to_lowercase().contains("chunked");
-                                                        if is_chunked {
-                                                            info!("[Session:{}] HTTP 응답에 chunked 인코딩 감지", session_id);
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            
-                                            // 헤더 이후 본문 길이 확인
-                                            let body_length = buffer_clone.len() - headers_end_pos;
-                                            
-                                            // Content-Length가 있고 본문이 이미 모두 도착한 경우
-                                            if let Some(len) = content_length {
-                                                if body_length >= len {
-                                                    info!("[Session:{}] 첫 패킷에 모든 본문 수신 완료, 길이: {}/{}", 
-                                                          session_id, body_length, len);
-                                                    
-                                                    // 응답 시간 측정 및 기록
-                                                    let duration_ms = {
-                                                        let mut times = request_times.write().await;
-                                                        if let Some(start_time) = times.remove(&current_response_for) {
-                                                            let duration = start_time.elapsed();
-                                                            Some(duration.as_millis() as u64)
-                                                        } else {
-                                                            None
-                                                        }
-                                                    };
-                                                    
-                                                    if let Some(duration_ms) = duration_ms {
-                                                        info!("[Session:{}] HTTP 응답 첫 패킷에 완료, 요청 #{}, 응답 시간: {}ms", 
-                                                              session_id, current_response_for, duration_ms);
-                                                        
-                                                        // 응답 시간 업데이트
-                                                        if let Ok(logger) = REQUEST_LOGGER.try_read() {
-                                                            let session_id_str = session_id.to_string();
-                                                            let duration_ms_copy = duration_ms;
-                                                            tokio::spawn(async move {
-                                                                match logger.update_response_time(&session_id_str, duration_ms_copy).await {
-                                                                    Ok(_) => info!("[Session:{}] 첫 패킷 응답 시간 업데이트 성공: {}ms", session_id_str, duration_ms_copy),
-                                                                    Err(e) => warn!("[Session:{}] 첫 패킷 응답 시간 업데이트 실패: {}", session_id_str, e)
-                                                                }
-                                                            });
-                                                        }
-                                                        
-                                                        // 요청 파싱 상태 초기화
-                                                        {
-                                                            let mut parsing = parsing_request.write().await;
-                                                            *parsing = false;
-                                                        }
-                                                        
-                                                        is_reading_response = false;
-                                                    }
-                                                }
-                                            } else if is_chunked {
-                                                // chunked 인코딩의 경우 종료 패턴 확인
-                                                if chunk_searcher.search_in(&buffer_clone).is_some() {
-                                                    info!("[Session:{}] 첫 패킷에 chunked 응답 완료 감지", session_id);
-                                                    
-                                                    // 응답 시간 측정 및 기록
-                                                    let duration_ms = {
-                                                        let mut times = request_times.write().await;
-                                                        if let Some(start_time) = times.remove(&current_response_for) {
-                                                            let duration = start_time.elapsed();
-                                                            Some(duration.as_millis() as u64)
-                                                        } else {
-                                                            None
-                                                        }
-                                                    };
-                                                    
-                                                    if let Some(duration_ms) = duration_ms {
-                                                        info!("[Session:{}] HTTP chunked 응답 첫 패킷에 완료, 요청 #{}, 응답 시간: {}ms", 
-                                                              session_id, current_response_for, duration_ms);
-                                                        
-                                                        // 응답 시간 업데이트
-                                                        if let Ok(logger) = REQUEST_LOGGER.try_read() {
-                                                            let session_id_str = session_id.to_string();
-                                                            let duration_ms_copy = duration_ms;
-                                                            tokio::spawn(async move {
-                                                                match logger.update_response_time(&session_id_str, duration_ms_copy).await {
-                                                                    Ok(_) => info!("[Session:{}] chunked 응답 시간 업데이트 성공: {}ms", session_id_str, duration_ms_copy),
-                                                                    Err(e) => warn!("[Session:{}] chunked 응답 시간 업데이트 실패: {}", session_id_str, e)
-                                                                }
-                                                            });
-                                                        }
-                                                        
-                                                        // 요청 파싱 상태 초기화
-                                                        {
-                                                            let mut parsing = parsing_request.write().await;
-                                                            *parsing = false;
-                                                        }
-                                                        
-                                                        is_reading_response = false;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        } else {
-                            // 응답 데이터 축적
-                            resp_buffer.put_slice(&buffer_clone); // bytes 대신 buffer_clone 사용
-                            
-                            // 응답 종료 확인 - 메모리 효율적인 방식으로 구현
-                            let mut response_completed = false;
-                            let resp_bytes = resp_buffer.as_ref();
-                            
-                            if let Some(headers_end_pos) = header_searcher.search_in(resp_bytes) {
-                                let headers_end_pos = headers_end_pos + 4; // \r\n\r\n 길이 포함
-                                
-                                // 응답 완료 확인 - 추출된 함수 사용
-                                let (is_complete, content_length, is_chunked) = 
-                                    is_response_complete(resp_bytes, headers_end_pos, &chunk_searcher);
-                                
-                                if is_complete {
-                                    // 응답 유형에 따른 로그 출력
-                                    if is_chunked {
-                                        debug!("[Session:{}] Chunked 응답 완료 감지, 요청 #{}", 
-                                              session_id, current_response_for);
-                                    } else if let Some(len) = content_length {
-                                        debug!("[Session:{}] Content-Length 응답 완료 감지, 요청 #{}, 길이: {}", 
-                                              session_id, current_response_for, len);
-                                    } else {
-                                        debug!("[Session:{}] 헤더 전용 응답 완료 감지, 요청 #{}", 
-                                              session_id, current_response_for);
-                                    }
-                                    
-                                    response_completed = true;
-                                }
-                            }
-                            
-                            // 응답 완료 감지 시 처리
-                            if response_completed {
-                                // 응답 시간 측정 및 기록 - 락 범위를 최소화
-                                let duration_ms = {
-                                    let mut times = request_times.write().await;
-                                    if let Some(start_time) = times.remove(&current_response_for) {
-                                        let duration = start_time.elapsed();
-                                        Some(duration.as_millis() as u64)
-                                    } else {
-                                        None
-                                    }
-                                };
-                                
-                                if let Some(duration_ms) = duration_ms {
-                                    // 응답 시간 로그 기록
-                                    info!("[Session:{}] HTTP 응답 완료, 요청 #{}, 응답 시간: {}ms", 
-                                          session_id, current_response_for, duration_ms);
-                                    
-                                    // 응답 시간 업데이트 함수 직접 호출
-                                    if let Ok(logger) = REQUEST_LOGGER.try_read() {
-                                        let session_id_str = session_id.to_string();
-                                        let duration_ms_copy = duration_ms;
-                                        tokio::spawn(async move {
-                                            match logger.update_response_time(&session_id_str, duration_ms_copy).await {
-                                                Ok(_) => info!("[Session:{}] 응답 시간 업데이트 성공: {}ms", session_id_str, duration_ms_copy),
-                                                Err(e) => warn!("[Session:{}] 응답 시간 업데이트 실패: {}", session_id_str, e)
-                                            }
-                                        });
-                                    }
-                                }
-                                
-                                is_reading_response = false;
-                                resp_buffer.clear();
-                                
-                                // 요청 처리 상태 초기화 - 락 범위 최소화
-                                {
-                                    let mut parsing = parsing_request.write().await;
-                                    *parsing = false;
-                                }
-                            }
-                        }
-                    },
-                    Err(e) => {
-                        error!("[Session:{}] Error reading from server: {}", session_id, e);
+    // 서버 -> 클라이언트 방향 프록시
+    let server_to_client = tokio::spawn(async move {
+        let mut buffer = BytesMut::with_capacity(buffer_size);
+        loop {
+            match server_read.read_buf(&mut buffer).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    if let Err(e) = client_write.write_all(&buffer[buffer.len() - n..]).await {
+                        error!("클라이언트에 데이터 전송 실패: {}", e);
                         break;
                     }
                 }
-            }
-            
-            debug!("[Session:{}] Server to client transfer finished: {} bytes", session_id, total_bytes);
-            Ok::<u64, io::Error>(total_bytes)
-        }
-    };
-    
-    // 양방향 전송 동시 실행
-    tokio::select! {
-        res = client_to_server => {
-            if let Err(e) = res {
-                error!("[Session:{}] Client to server transfer failed: {}", session_id, e);
-            }
-        },
-        res = server_to_client => {
-            if let Err(e) = res {
-                error!("[Session:{}] Server to client transfer failed: {}", session_id, e);
-            }
-        },
-    }
-    
-    // 세션 종료 시 모든 미완료 요청에 대한 타임아웃 처리
-    {
-        // 범위를 제한하여 times가 .await 호출을 넘어서지 않도록 함
-        let times = request_times.read().await;
-        let mut unfinished_requests = Vec::new();
-        
-        // 미완료 요청 정보를 복사
-        for (req_id, start_time) in times.iter() {
-            let response_time = start_time.elapsed().as_millis() as u64;
-            unfinished_requests.push((*req_id, response_time));
-            warn!("[Session:{}] HTTP 요청 #{} 미완료 종료, 시간: {} ms", session_id, req_id, response_time);
-        }
-        
-        // times 락 해제
-        drop(times);
-        
-        // 미완료 요청에 대해 응답 시간 기록
-        for (req_id, response_time) in unfinished_requests {
-            if let Ok(logger) = REQUEST_LOGGER.try_read() {
-                // 세션 ID 복사 및 별도 태스크로 실행하여 블로킹 방지
-                let session_id_str = session_id.to_string();
-                let req_id_copy = req_id;
-                let response_time_copy = response_time;
-                
-                tokio::spawn(async move {
-                    match logger.update_response_time(&session_id_str, response_time_copy).await {
-                        Ok(_) => debug!("[Session:{}] 미완료 요청 #{} 응답 시간 업데이트 성공: {}ms", 
-                                       session_id_str, req_id_copy, response_time_copy),
-                        Err(e) => warn!("[Session:{}] 미완료 요청 #{} 응답 시간 업데이트 실패: {}", 
-                                       session_id_str, req_id_copy, e)
-                    }
-                });
+                Err(e) => {
+                    error!("서버로부터 읽기 오류: {}", e);
+                    break;
+                }
             }
         }
-    }
+    });
     
-    // 세션 전체 시간도 기록 (디버깅 및 모니터링용)
-    let total_session_time = request_start_time.elapsed().as_millis() as u64;
-    info!("[Session:{}] HTTP 세션 종료, 총 세션 시간: {} ms", session_id, total_session_time);
+    // 양방향 프록시 완료 대기
+    let _ = tokio::join!(client_to_server, server_to_client);
+    
+    // 세션 완료 로깅
+    debug!("[Session:{}] 양방향 HTTP 세션 완료", session_id_str);
     
     Ok(())
-} 
+}

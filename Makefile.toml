@@ -1,0 +1,134 @@
+[env]
+# 환경 변수 설정
+RUSTC_WRAPPER = "sccache"
+
+[tasks.setup]
+# 개발 환경 설정
+script_runner = "@shell"
+script = '''
+# 기본 도구 설치
+echo "Updating package lists..."
+apt-get update
+
+if ! command -v mold &> /dev/null; then
+    echo "Installing mold linker..."
+    apt-get install -y mold
+fi
+
+if ! command -v sccache &> /dev/null; then
+    echo "Installing sccache..."
+    cargo install sccache
+fi
+
+if ! command -v ethtool &> /dev/null; then
+    echo "Installing ethtool and other utilities..."
+    apt-get install -y ethtool
+fi
+
+# 환경 변수 설정
+echo "Setting up environment variables..."
+echo 'export RUST_MIN_STACK=8388608' >> /root/.bashrc
+source /root/.bashrc
+
+# 시스템 설정
+echo "Configuring system settings..."
+# 파일 디스크립터 제한
+echo "* soft nofile 1000000" >> /etc/security/limits.conf
+echo "* hard nofile 1000000" >> /etc/security/limits.conf
+
+# 커널 파라미터
+cat >> /etc/sysctl.conf << "EOL"
+# TCP/IP 최적화
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+net.core.netdev_max_backlog = 65535
+
+# TCP 버퍼 크기
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+
+# TIME_WAIT 소켓 재사용
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 10
+EOL
+
+# 설정 적용
+sysctl -p
+
+# 개발용 Cargo 설정
+mkdir -p /root/.cargo
+cat > /root/.cargo/config.toml << 'EOL'
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+[build]
+rustflags = ["-C", "target-cpu=native"]
+
+[profile.dev]
+opt-level = 1
+codegen-units = 16
+incremental = true
+debug = true
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+EOL
+
+echo ""
+echo "Setup complete! Some changes may require a reboot to take effect."
+echo "Please run: source /root/.bashrc"
+echo "Recommended to reboot the system for all changes to take effect."
+'''
+
+[tasks.dev-config]
+# 개발 설정만 적용 (시스템 설정 없음)
+script_runner = "@shell"
+script = '''
+# 개발용 Cargo 설정
+mkdir -p /root/.cargo
+cat > /root/.cargo/config.toml << 'EOL'
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+[build]
+rustflags = ["-C", "target-cpu=native"]
+
+[profile.dev]
+opt-level = 1
+codegen-units = 16
+incremental = true
+debug = true
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+EOL
+
+echo "Development configuration applied!"
+'''
+
+[tasks.dev]
+# 개발 빌드
+dependencies = ["dev-config"]
+command = "cargo"
+args = ["build"]
+
+[tasks.release]
+# 릴리즈 빌드
+dependencies = ["dev-config"]
+command = "cargo"
+args = ["build", "--release"]
+
+[tasks.clean]
+# 빌드 캐시 정리
+command = "cargo"
+args = ["clean"]
