@@ -8,7 +8,6 @@ use super::config::DbConfig;
 use crate::constants::request_logs;
 use crate::constants::proxy_stats;
 use crate::constants::proxy_stats_hourly;
-use crate::constants::partition;
 
 /// 테이블 유형 정의
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -51,39 +50,42 @@ impl PartitionManager {
         let mut created_partitions = Vec::new();
         let table_name = table_type.get_name();
         
-        // 직접 SQL 실행 대신 저장된 SQL 스크립트 사용
-        match tokio::time::timeout(
-            tokio::time::Duration::from_secs(10), // 10초 타임아웃
-            client.execute(
-                partition::CREATE_FUTURE_PARTITIONS,
-                &[&table_name, &(num_days as i32)]
-            )
-        ).await {
-            Ok(Ok(_)) => {
-                info!("파티션 자동 생성 스크립트 실행 완료: {}, {} 일 생성", table_name, num_days);
-                
-                // 생성된 파티션 이름 구성
-                for i in 0..num_days {
-                    let date = start_date + Duration::days(i as i64);
-                    let partition_name = self.get_partition_name(table_name, date);
-                    created_partitions.push(partition_name);
+        // 익명 PL/pgSQL 블록 대신 각 파티션을 직접 생성
+        for i in 0..num_days {
+            let date = start_date + Duration::days(i as i64);
+            let next_date = date + Duration::days(1);
+            let partition_name = self.get_partition_name(table_name, date);
+            
+            // 파티션 생성 SQL
+            let create_partition_sql = format!(
+                "CREATE TABLE IF NOT EXISTS {} PARTITION OF {} 
+                 FOR VALUES FROM ('{}') TO ('{}')",
+                partition_name, table_name, date, next_date
+            );
+            
+            // 파티션 생성 실행
+            match client.execute(&create_partition_sql, &[]).await {
+                Ok(_) => {
+                    debug!("파티션 생성 완료: {}", partition_name);
+                    created_partitions.push(partition_name.clone());
+                    
+                    // 파티션별 인덱스 생성
+                    if let Err(e) = self.create_partition_indices(client, table_type, &partition_name).await {
+                        error!("파티션 인덱스 생성 실패: {} - {}", partition_name, e);
+                    }
+                },
+                Err(e) => {
+                    // 이미 존재하는 파티션인 경우 무시하고 계속 진행
+                    if e.to_string().contains("already exists") {
+                        debug!("파티션이 이미 존재함: {}", partition_name);
+                    } else {
+                        error!("파티션 생성 실패: {} - {}", partition_name, e);
+                    }
                 }
-                
-                // 파티션별 인덱스 생성
-                for partition_name in &created_partitions {
-                    self.create_partition_indices(client, table_type, partition_name).await?;
-                }
-            },
-            Ok(Err(e)) => {
-                error!("파티션 생성 스크립트 실행 실패: {}", e);
-                return Err(e.into());
-            },
-            Err(_) => {
-                error!("파티션 생성 스크립트 실행 타임아웃");
-                return Err("파티션 생성 스크립트 실행 타임아웃".into());
             }
         }
         
+        info!("파티션 자동 생성 완료: {}, {} 일 생성", table_name, created_partitions.len());
         Ok(created_partitions)
     }
     
@@ -226,27 +228,50 @@ impl PartitionManager {
         // 테이블 이름 가져오기
         let table_name = table_type.get_name();
         
-        // 직접 SQL 실행 대신 저장된 SQL 스크립트 사용
-        match tokio::time::timeout(
-            tokio::time::Duration::from_secs(10), // 10초 타임아웃
-            client.execute(
-                partition::DROP_OLD_PARTITIONS,
-                &[&table_name, &older_than_days]
-            )
-        ).await {
-            Ok(Ok(count)) => {
-                info!("오래된 파티션 삭제 스크립트 실행 완료: {}, {} 일 이전 삭제", table_name, older_than_days);
-                Ok(count as usize)
-            },
-            Ok(Err(e)) => {
-                error!("오래된 파티션 삭제 스크립트 실행 실패: {}", e);
-                Err(e.into())
-            },
-            Err(_) => {
-                error!("오래된 파티션 삭제 스크립트 실행 타임아웃");
-                Err("오래된 파티션 삭제 스크립트 실행 타임아웃".into())
+        // 오래된 파티션 찾기
+        let cutoff_date = chrono::Local::now().date_naive() - Duration::days(older_than_days as i64);
+        let cutoff_str = format!("{:04}{:02}{:02}", cutoff_date.year(), cutoff_date.month(), cutoff_date.day());
+        
+        // 삭제할 파티션 조회
+        let query = "
+            SELECT tablename 
+            FROM pg_tables 
+            WHERE schemaname = 'public' 
+            AND tablename LIKE $1 
+            AND tablename < $2
+        ";
+        
+        let like_pattern = format!("{}_%", table_name);
+        let cutoff_pattern = format!("{}_{}", table_name, cutoff_str);
+        
+        let rows = match client.query(query, &[&like_pattern, &cutoff_pattern]).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                error!("오래된 파티션 조회 실패: {}", e);
+                return Err(e.into());
+            }
+        };
+        
+        let mut dropped_count = 0;
+        
+        // 각 파티션 삭제
+        for row in rows {
+            let partition_name: String = row.get(0);
+            let drop_query = format!("DROP TABLE IF EXISTS {}", partition_name);
+            
+            match client.execute(&drop_query, &[]).await {
+                Ok(_) => {
+                    debug!("오래된 파티션 삭제 완료: {}", partition_name);
+                    dropped_count += 1;
+                },
+                Err(e) => {
+                    error!("파티션 삭제 실패: {} - {}", partition_name, e);
+                }
             }
         }
+        
+        info!("오래된 파티션 삭제 완료: {}, {} 개 삭제됨", table_name, dropped_count);
+        Ok(dropped_count)
     }
     
     /// 파티션 자동 생성 백그라운드 작업 시작
@@ -254,21 +279,48 @@ impl PartitionManager {
         tokio::spawn(async move {
             info!("파티션 자동 생성 스케줄러 시작");
             
-            // 먼저 파티션 매니저 생성
+            // 파티션 매니저 생성
             let partition_manager = PartitionManager::new(config.clone());
+            let creation_interval = config.partitioning.creation_interval as i32;
+            let future_partitions = config.partitioning.future_partitions as i32;
+            
+            info!(
+                "파티션 설정: 생성 주기 {} 일, 미래 파티션 {} 개, 보관 기간 {} 일", 
+                creation_interval, 
+                future_partitions, 
+                config.partitioning.retention_period
+            );
             
             // 파티션 생성 작업 실행 함수
-            async fn execute_partition_tasks(partition_manager: &PartitionManager) {
+            async fn execute_partition_tasks(
+                partition_manager: &PartitionManager, 
+                creation_interval: i32,
+                future_partitions: i32
+            ) {
                 let today = Local::now().date_naive();
                 info!("파티션 생성 작업 실행: 오늘 날짜 {}", today);
                 
-                // 오늘 파티션 생성
-                create_all_partitions(partition_manager, today).await;
+                // 현재 날짜부터 creation_interval 간격으로 미래 파티션 생성
+                for i in 0..=future_partitions {
+                    let target_date = today + Duration::days((i * creation_interval) as i64);
+                    info!("파티션 생성 대상 날짜: {}", target_date);
+                    create_all_partitions(partition_manager, target_date).await;
+                }
                 
-                // 내일 파티션 미리 생성
-                let tomorrow = today + Duration::days(1);
-                info!("내일 날짜 파티션 미리 생성: {}", tomorrow);
-                create_all_partitions(partition_manager, tomorrow).await;
+                // 오늘 날짜에서 creation_interval 간격으로 다음 체크해야 할 날짜들 확인
+                let mut next_check_dates = Vec::new();
+                if creation_interval > 1 {
+                    // 생성 간격이 1일 초과일 경우 다음 체크 날짜들을 계산
+                    for i in 1..creation_interval {
+                        let next_date = today + Duration::days(i as i64);
+                        next_check_dates.push(next_date);
+                    }
+                    
+                    if !next_check_dates.is_empty() {
+                        info!("다음 {} 일 동안 체크할 파티션 생성 날짜: {:?}", 
+                               creation_interval - 1, next_check_dates);
+                    }
+                }
                 
                 // 오래된 파티션 정리
                 if let Ok(client) = get_client().await {
@@ -297,12 +349,20 @@ impl PartitionManager {
             }
             
             // 초기 파티션 생성
-            execute_partition_tasks(&partition_manager).await;
+            execute_partition_tasks(&partition_manager, creation_interval, future_partitions).await;
             
-            // 매일 자정 직후 파티션 생성을 위한 스케줄러 루프
+            // 매일 자정 직전 파티션 생성을 위한 스케줄러 루프
             loop {
                 // 현재 시간
                 let now = Local::now();
+                
+                // 파티션 생성 주기가 1일 초과일 경우 오늘이 파티션 생성일인지 확인
+                let is_creation_day = if creation_interval > 1 {
+                    let days_since_epoch: i64 = now.date_naive().num_days_from_ce().into();
+                    days_since_epoch % (creation_interval as i64) == 0
+                } else {
+                    true // 생성 주기가 1일이면 매일 실행
+                };
                 
                 // 다음 자정까지 남은 시간 계산 (초 단위)
                 let seconds_until_midnight = {
@@ -320,32 +380,88 @@ impl PartitionManager {
                 };
                 
                 // 자정까지 남은 시간에 따라 다른 대기 시간 설정
-                let wait_seconds = if seconds_until_midnight < 300 {
-                    // 자정 5분 전 - 자정 직후로 타이밍 맞추기
-                    info!("자정이 {} 초 남음, 자정 직후 파티션 생성 준비", seconds_until_midnight);
-                    seconds_until_midnight + 5 // 자정 이후 5초 추가
-                } else if seconds_until_midnight < 1800 { // 30분 미만
-                    info!("자정까지 {} 초 남음, 10분 후 다시 확인", seconds_until_midnight);
-                    600 // 10분
-                } else if seconds_until_midnight < 7200 { // 2시간 미만
-                    info!("자정까지 {} 초 남음, 30분 후 다시 확인", seconds_until_midnight);
-                    1800 // 30분
+                let wait_seconds = if seconds_until_midnight <= 3600 {
+                    // 자정 1시간 전 - 파티션 생성 시작 (파티션 생성일이거나 creation_interval이 1일 경우)
+                    if is_creation_day {
+                        info!("자정이 {} 초 남음, 파티션 생성 준비", seconds_until_midnight);
+                        if seconds_until_midnight <= 60 {
+                            // 1분 이내로 남으면 바로 실행
+                            0
+                        } else {
+                            // 자정 1시간 전에 맞추기 위해 대기
+                            seconds_until_midnight - 3600
+                        }
+                    } else {
+                        info!("오늘은 파티션 생성일이 아님 (주기: {} 일), 자정까지 대기", creation_interval);
+                        seconds_until_midnight + 60 // 자정 이후 1분 더 대기
+                    }
                 } else {
                     info!("자정까지 {} 초 남음, 1시간 후 다시 확인", seconds_until_midnight);
                     3600 // 1시간
                 };
                 
-                // 지정된 시간만큼 대기
-                tokio::time::sleep(std::time::Duration::from_secs(wait_seconds)).await;
+                // 대기 시간이 있으면 대기
+                if wait_seconds > 0 {
+                    tokio::time::sleep(std::time::Duration::from_secs(wait_seconds)).await;
+                }
                 
-                // 자정이 지났는지 확인 (0시 ~ 0시 5분 사이인지)
+                // 자정 1시간 전인지 확인
                 let now_after_wait = Local::now();
-                if now_after_wait.hour() == 0 && now_after_wait.minute() < 5 {
-                    info!("자정 직후 감지됨, 파티션 생성 작업 시작");
-                    execute_partition_tasks(&partition_manager).await;
+                let seconds_to_midnight = {
+                    // 자정의 NaiveDateTime 생성
+                    let midnight = now_after_wait.date_naive()
+                        .and_hms_opt(0, 0, 0)
+                        .unwrap();
                     
-                    // 자정 직후 파티션 생성 완료했으면 충분히 대기 (1시간)
-                    tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                    // 다음 자정 계산
+                    let next_midnight = if now_after_wait.hour() < 12 {
+                        // 현재 0시 이후면 다음 자정은 다음 날
+                        midnight + Duration::days(1)
+                    } else {
+                        // 아니면 오늘 자정
+                        midnight
+                    };
+                    
+                    // 현재 시간을 NaiveDateTime으로 변환
+                    let now_naive = now_after_wait.naive_local();
+                    
+                    // 자정까지 남은 시간 계산
+                    let duration = next_midnight.signed_duration_since(now_naive);
+                    duration.num_seconds() as i64
+                };
+                
+                // 파티션 생성일인지 다시 확인 (대기 중 날짜가 바뀔 수 있음)
+                let is_creation_day_after_wait = if creation_interval > 1 {
+                    let days_since_epoch: i64 = now_after_wait.date_naive().num_days_from_ce().into();
+                    days_since_epoch % (creation_interval as i64) == 0
+                } else {
+                    true // 생성 주기가 1일이면 매일 실행
+                };
+                
+                // 자정 1시간 전(3600초) ~ 자정 사이이고 파티션 생성일인지 확인
+                if seconds_to_midnight <= 3600 && seconds_to_midnight > 0 && is_creation_day_after_wait {
+                    info!("자정 {}초 전, 파티션 생성 작업 시작 (creation_interval: {} 일)", 
+                         seconds_to_midnight, creation_interval);
+                    execute_partition_tasks(&partition_manager, creation_interval, future_partitions).await;
+                    
+                    // 파티션 생성 완료 후 자정이 지날 때까지 대기
+                    let sleep_time = seconds_to_midnight as u64 + 60; // 자정 이후 1분 추가
+                    tokio::time::sleep(std::time::Duration::from_secs(sleep_time)).await;
+                }
+                
+                // 오늘 날짜의 마지막 파티션 생성 주기 확인
+                let today = now_after_wait.date_naive();
+                if creation_interval > 1 {
+                    // 생성 주기가 1일 이상일 때 확인
+                    let days_since_epoch: i64 = today.num_days_from_ce().into();
+                    let creation_interval_i64 = creation_interval as i64;
+                    let days_to_next_creation = (creation_interval_i64 - (days_since_epoch % creation_interval_i64)) % creation_interval_i64;
+                    
+                    if days_to_next_creation == 0 {
+                        info!("오늘은 파티션 생성 주기({} 일)에 해당하는 날입니다", creation_interval);
+                    } else {
+                        debug!("다음 파티션 생성일까지 {} 일 남음 (주기: {} 일)", days_to_next_creation, creation_interval);
+                    }
                 }
             }
         });
@@ -362,48 +478,58 @@ impl PartitionManager {
         let mut created_partitions = Vec::new();
         let table_name = table_type.get_name();
         
-        // 직접 SQL 실행 대신 저장된 SQL 스크립트 사용
-        match tokio::time::timeout(
-            tokio::time::Duration::from_secs(10), // 10초 타임아웃
-            client.execute(
-                partition::CREATE_MONTHLY_PARTITIONS,
-                &[&table_name, &(num_months as i32)]
-            )
-        ).await {
-            Ok(Ok(_)) => {
-                info!("월간 파티션 자동 생성 스크립트 실행 완료: {}, {} 개월 생성", table_name, num_months);
-                
-                // 생성된 파티션 이름 구성
-                for i in 0..num_months {
-                    let current_month = start_date.month() as i32;
-                    let current_year = start_date.year();
+        // 각 월별 파티션을 직접 생성
+        for i in 0..num_months {
+            // 월 계산
+            let current_month = start_date.month() as i32;
+            let current_year = start_date.year();
+            
+            let months_to_add = i;
+            let year_offset = (current_month + months_to_add - 1) / 12;
+            let new_month = ((current_month + months_to_add - 1) % 12) + 1;
+            let new_year = current_year + year_offset;
+            
+            // 해당 월의 첫째 날과 다음 달의 첫째 날
+            let month_start = chrono::NaiveDate::from_ymd_opt(new_year, new_month as u32, 1).unwrap();
+            let next_month = if new_month == 12 {
+                chrono::NaiveDate::from_ymd_opt(new_year + 1, 1, 1).unwrap()
+            } else {
+                chrono::NaiveDate::from_ymd_opt(new_year, (new_month + 1) as u32, 1).unwrap()
+            };
+            
+            // 파티션 이름 (YYYYMM 형식)
+            let partition_name = format!("{}_{:04}{:02}", table_name, new_year, new_month);
+            
+            // 파티션 생성 SQL
+            let create_partition_sql = format!(
+                "CREATE TABLE IF NOT EXISTS {} PARTITION OF {} 
+                 FOR VALUES FROM ('{}') TO ('{}')",
+                partition_name, table_name, month_start, next_month
+            );
+            
+            // 파티션 생성 실행
+            match client.execute(&create_partition_sql, &[]).await {
+                Ok(_) => {
+                    debug!("월간 파티션 생성 완료: {}", partition_name);
+                    created_partitions.push(partition_name.clone());
                     
-                    let months_to_add = current_month + i - 1;
-                    let year_offset = months_to_add / 12;
-                    let new_month = (months_to_add % 12) + 1;
-                    let new_year = current_year + year_offset;
-                    
-                    // 해당 월의 첫째 날
-                    let date = chrono::NaiveDate::from_ymd_opt(new_year, new_month as u32, 1).unwrap();
-                    let partition_name = format!("{}_{:04}{:02}", table_name, date.year(), date.month());
-                    created_partitions.push(partition_name);
+                    // 파티션별 인덱스 생성
+                    if let Err(e) = self.create_partition_indices(client, table_type, &partition_name).await {
+                        error!("월간 파티션 인덱스 생성 실패: {} - {}", partition_name, e);
+                    }
+                },
+                Err(e) => {
+                    // 이미 존재하는 파티션인 경우 무시하고 계속 진행
+                    if e.to_string().contains("already exists") {
+                        debug!("월간 파티션이 이미 존재함: {}", partition_name);
+                    } else {
+                        error!("월간 파티션 생성 실패: {} - {}", partition_name, e);
+                    }
                 }
-                
-                // 파티션별 인덱스 생성
-                for partition_name in &created_partitions {
-                    self.create_partition_indices(client, table_type, partition_name).await?;
-                }
-            },
-            Ok(Err(e)) => {
-                error!("월간 파티션 생성 스크립트 실행 실패: {}", e);
-                return Err(e.into());
-            },
-            Err(_) => {
-                error!("월간 파티션 생성 스크립트 실행 타임아웃");
-                return Err("월간 파티션 생성 스크립트 실행 타임아웃".into());
             }
         }
         
+        info!("월간 파티션 자동 생성 완료: {}, {} 개월 생성", table_name, created_partitions.len());
         Ok(created_partitions)
     }
 }
@@ -413,9 +539,6 @@ async fn create_all_partitions(partition_manager: &PartitionManager, target_date
     // DB 연결 시도
     match get_client().await {
         Ok(client) => {
-            // future_partitions 값은 partition_manager의 config에서 가져온 값 사용
-            let future_partitions = partition_manager.config.partitioning.future_partitions as i32;
-            
             // 테이블 타입별 파티션 생성
             let tables = [
                 (TableType::RequestLogs, "request_logs"),
@@ -427,17 +550,17 @@ async fn create_all_partitions(partition_manager: &PartitionManager, target_date
                     &client, 
                     table_type, 
                     target_date, 
-                    future_partitions
+                    1  // 한 번에 하루치 파티션 생성
                 ).await {
                     Ok(partitions) => {
                         if !partitions.is_empty() {
-                            info!("{} 파티션 생성 완료: {} 개", name, partitions.len());
+                            info!("{} 파티션 생성 완료: {} {}", name, target_date, partitions.len());
                         } else {
-                            debug!("{} 파티션이 이미 모두 존재함", name);
+                            debug!("{} 파티션이 이미 모두 존재함: {}", name, target_date);
                         }
                     },
                     Err(e) => {
-                        error!("{} 파티션 생성 실패: {}", name, e);
+                        error!("{} 파티션 생성 실패: {} - {}", name, target_date, e);
                     }
                 }
             }
@@ -467,7 +590,7 @@ async fn create_all_partitions(partition_manager: &PartitionManager, target_date
                     &client, 
                     TableType::ProxyStatsHourly, 
                     next_month_date, 
-                    1 // 월간 파티션은 한 달만 생성
+                    2 // 현재 월 + 다음 월 파티션 생성
                 ).await {
                     Ok(partitions) => {
                         if !partitions.is_empty() {
