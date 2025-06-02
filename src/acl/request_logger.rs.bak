@@ -244,6 +244,7 @@ impl RequestLogger {
         let mut log_batch = LogBatch::new();
         let mut response_time_batch = ResponseTimeBatch::new();
         let mut last_flush_time = Instant::now();
+        let mut last_response_time_update = Instant::now();
         
         // 배치 플러시 주기
         let flush_interval = TokioDuration::from_millis(LOG_FLUSH_INTERVAL_MS);

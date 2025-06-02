@@ -1,4 +1,4 @@
-/// proxy_stats_hourly 테이블 관련 SQL 쿼리
+/// 시간당 프록시 통계 관련 SQL 쿼리
 
 /// 테이블 존재 여부 확인 쿼리
 pub const CHECK_TABLE_EXISTS: &str = "
@@ -63,9 +63,4 @@ pub const INSERT_STATS: &str = "
     ) VALUES (
         $1, $2, $3, $4, $5, $6, $7, $8
     )
-";
-
-/// 파티션 인덱스 생성 쿼리 포맷 문자열
-pub const CREATE_PARTITION_INDEX_FORMAT: &str = "
-    CREATE INDEX IF NOT EXISTS {}_timestamp_idx ON {} (timestamp)
 "; 

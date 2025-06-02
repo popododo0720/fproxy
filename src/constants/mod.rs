@@ -5,7 +5,6 @@ pub mod proxy_stats_hourly;
 pub mod partition;
 pub mod domain_blocks;
 pub mod domain_pattern_blocks;
-pub mod metrics_queries;
 
 // 버퍼 크기
 pub const BUFFER_SIZE_SMALL: usize = 64 * 1024;   // 64KB
