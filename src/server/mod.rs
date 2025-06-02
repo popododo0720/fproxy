@@ -10,21 +10,25 @@ use crate::config::Config;
 use crate::metrics::{Metrics};
 use crate::buffer::BufferPool;
 use crate::session::Session;
-
-
+use crate::logging::Logger;
+use crate::acl::domain_blocker::DomainBlocker;
 
 pub struct ProxyServer {
     config: Arc<Config>,
     metrics: Arc<Metrics>,
     buffer_pool: Option<Arc<BufferPool>>,
+    logger: Arc<Logger>,
+    domain_blocker: Arc<DomainBlocker>,
 }
 
 impl ProxyServer {
-    pub fn new(config: Arc<Config>, metrics: Arc<Metrics>, buffer_pool: Option<Arc<BufferPool>>) -> Self {
+    pub fn new(config: Arc<Config>, metrics: Arc<Metrics>, buffer_pool: Option<Arc<BufferPool>>, logger: Arc<Logger>, domain_blocker: Arc<DomainBlocker>) -> Self {
         Self {
             config,
             metrics,
             buffer_pool,
+            logger,
+            domain_blocker,
         }
     }
 
@@ -44,6 +48,8 @@ impl ProxyServer {
             let worker_metrics = self.metrics.clone();
             let worker_config = self.config.clone();
             let worker_buffer_pool = self.buffer_pool.clone();
+            let worker_logger = self.logger.clone();
+            let worker_domain_blocker = self.domain_blocker.clone();
 
             tokio::spawn(async move {
                 info!("worker #{} start", worker_id);
@@ -63,6 +69,8 @@ impl ProxyServer {
                         worker_metrics.clone(),
                         worker_config.clone(),
                         worker_buffer_pool.clone(),
+                        worker_logger.clone(),
+                        worker_domain_blocker.clone(),
                     );
 
                     tokio::spawn(async move {

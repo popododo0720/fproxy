@@ -1,12 +1,9 @@
 use std::error::Error;
-use std::sync::Arc;
 use std::path::Path;
-#[cfg(debug_assertions)]
+use std::sync::Arc;
 use std::io::Write;
-#[cfg(debug_assertions)]
+use log::{debug, error, info, warn, LevelFilter};
 use chrono::Local;
-
-use log::{LevelFilter, info, warn, error, debug};
 use env_logger::Builder;
 use once_cell::sync::Lazy;
 
@@ -20,15 +17,16 @@ mod tls;
 mod proxy;
 mod acl;
 mod db;
+mod logging;
 
 use config::Config;
 use metrics::Metrics;
-use constants::*;
 use buffer::BufferPool;
+use constants::*;
 use server::ProxyServer;
 use tls::init_root_ca;
 use tls::load_trusted_certificates;
-use acl::request_logger::RequestLogger;
+use logging::Logger;
 use acl::domain_blocker::DomainBlocker;
 use db::config::DbConfig;
 
@@ -38,17 +36,6 @@ static FD_LIMIT: Lazy<u64> = Lazy::new(|| {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1000000) // 기본값 1M
-});
-
-// 전역 RequestLogger 인스턴스
-static REQUEST_LOGGER: Lazy<Arc<tokio::sync::RwLock<RequestLogger>>> = Lazy::new(|| {
-    Arc::new(tokio::sync::RwLock::new(RequestLogger::new()))
-});
-
-// 전역 DomainBlocker 인스턴스
-static DOMAIN_BLOCKER: Lazy<Arc<DomainBlocker>> = Lazy::new(|| {
-    // 기본 설정으로 초기화 (실제 설정은 main에서 업데이트됨)
-    Arc::new(DomainBlocker::new(Arc::new(Config::new())))
 });
 
 #[tokio::main]
@@ -71,24 +58,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // SSL 디렉토리 확인 및 생성
     ensure_ssl_directories(&config)?;
-
-    // 메트릭스 초기화
-    let metrics = Metrics::new();
     
-    // 버퍼 풀 초기화
-    let buffer_pool = create_buffer_pool();
-    info!("버퍼 풀 초기화: 소형 {}, 중형 {}, 대형 {}", SMALL_POOL_SIZE, MEDIUM_POOL_SIZE, LARGE_POOL_SIZE);
-
-    // RequestLogger 초기화
-    initialize_request_logger().await?;
-    
-    // DomainBlocker 설정 업데이트
-    {
-        // 새로운 DomainBlocker 인스턴스 생성 (이미 전역 변수에 의해 초기화됨)
-        // DOMAIN_BLOCKER는 이미 Arc로 감싸져 있으므로 추가 조작 없이 사용
-        info!("도메인 차단기 초기화 완료");
-    }
-
     // TLS 루트 CA 인증서 초기화
     if let Err(e) = init_root_ca() {
         error!("루트 CA 초기화 실패: {}", e);
@@ -97,16 +67,46 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     
     // ssl/trusted_certs 폴더에서 신뢰할 인증서 자동 로드
-    if let Err(e) = load_trusted_certificates(Arc::get_mut(&mut config).unwrap()) {
+    if let Err(e) = load_trusted_certificates(&mut config) {
         error!("신뢰할 인증서 로드 실패: {}", e);
     }
+    
+    // config를 Arc로 감싸서 공유 가능하게 함
+    let config = Arc::new(config);
+    
+    // 메트릭스 초기화
+    let metrics = Metrics::new();
+    
+    // 버퍼 풀 초기화
+    let buffer_pool = Arc::new(create_buffer_pool());
+    info!("버퍼 풀 초기화: 소형 {}, 중형 {}, 대형 {}", SMALL_POOL_SIZE, MEDIUM_POOL_SIZE, LARGE_POOL_SIZE);
 
+    // Logger 인스턴스 생성
+    let mut logger = Logger::new();
+    // 비동기 초기화 수행
+    match logger.init().await {
+        Ok(_) => info!("로거 초기화 완료"),
+        Err(e) => error!("로거 초기화 실패: {}", e)
+    }
+    // Arc로 감싸서 공유 가능하게 함
+    let logger = Arc::new(logger);
+    
     // 워커 스레드 설정
     let worker_threads = config.worker_threads.unwrap_or_else(|| num_cpus);
+    
+    // DomainBlocker 인스턴스 생성 (config는 이미 Arc<Config> 타입)
+    let domain_blocker = Arc::new(DomainBlocker::new(config.clone()));
+    
+    // DomainBlocker 초기화 (비동기 초기화 메서드 명시적 호출)
+    match domain_blocker.initialize().await {
+        Ok(_) => info!("도메인 차단기 초기화 완료"),
+        Err(e) => error!("도메인 차단기 초기화 실패: {}", e)
+    }
+
     info!("워커 스레드 수: {}", worker_threads);
 
     // 프록시 서버 시작
-    let server = ProxyServer::new(config, metrics, Some(buffer_pool));
+    let server = ProxyServer::new(config, metrics, Some(buffer_pool), logger.clone(), domain_blocker);
     server.run().await?;
 
     Ok(())
@@ -157,23 +157,23 @@ fn setup_resource_limits() {
     }
 }
 
-/// 설정 파일 로드
-fn load_config() -> Result<Arc<Config>, Box<dyn Error>> {
+/// 프록시 설정 로드
+fn load_config() -> Result<Config, Box<dyn Error>> {
     // 먼저 현재 디렉토리의 config.yml 파일 확인
     if Path::new("config.yml").exists() {
         info!("설정 파일 로드: config.yml");
-        return Ok(Arc::new(Config::from_file("config.yml")?));
+        return Ok(Config::from_file("config.yml")?);
     }
     
     // 환경 변수에서 설정 파일 경로 확인
     match std::env::var("CONFIG_FILE") {
         Ok(path) => {
             info!("환경 변수에서 설정 파일 로드: {}", path);
-            Ok(Arc::new(Config::from_file(&path)?))
+            Ok(Config::from_file(&path)?)
         },
         Err(_) => {
             info!("설정 파일을 찾을 수 없어 기본 설정 사용");
-            Ok(Arc::new(Config::new()))
+            Ok(Config::new())
         }
     }
 }
@@ -206,47 +206,33 @@ async fn setup_database() -> Result<(), Box<dyn Error>> {
 }
 
 /// 버퍼 풀 생성
-fn create_buffer_pool() -> Arc<BufferPool> {
-    Arc::new(BufferPool::new(
+fn create_buffer_pool() -> BufferPool {
+    BufferPool::new(
         SMALL_POOL_SIZE,  // 64KB
         MEDIUM_POOL_SIZE, // 256KB
         LARGE_POOL_SIZE   // 1MB
-    ))
+    )
 }
 
-/// RequestLogger 초기화
-async fn initialize_request_logger() -> Result<(), Box<dyn Error>> {
-    info!("RequestLogger 초기화 시작...");
-    let mut logger = REQUEST_LOGGER.write().await;
+/// 로깅 시스템 초기화
+async fn initialize_logger() -> Result<(), Box<dyn Error>> {
+    info!("로깅 시스템 초기화 중...");
     
-    match logger.init().await {
-        Ok(_) => {
-            info!("RequestLogger 초기화 성공");
-            Ok(())
-        },
-        Err(e) => {
-            error!("RequestLogger 초기화 실패: {}", e);
-            Err(e)
-        }
-    }
+    // 이 함수는 더 이상 사용하지 않지만 호환성을 위해 유지
+    
+    info!("로깅 시스템 초기화 완료");
+    Ok(())
 }
 
-/// 데이터베이스 초기화 함수
+/// 데이터베이스 초기화
 async fn initialize_database() -> Result<(), Box<dyn Error>> {
-    // 파티션 확인 및 생성 - 타임아웃 추가
-    info!("데이터베이스 파티션 확인");
-    match tokio::time::timeout(
-        tokio::time::Duration::from_secs(60), // 60초 타임아웃
-        db::ensure_partitions()
-    ).await {
-        Ok(Ok(_)) => {
-            info!("데이터베이스 파티션 확인 완료");
-        },
-        Ok(Err(e)) => {
-            debug!("파티션 확인 실패: {}", e);
-        },
-        Err(_) => {
-            debug!("데이터베이스 파티션 확인 타임아웃, 계속 진행합니다");
+    // 파티션 관리 확인
+    debug!("데이터베이스 파티션 확인 중...");
+    match db::ensure_partitions().await {
+        Ok(_) => debug!("데이터베이스 파티션 확인 완료"),
+        Err(e) => {
+            warn!("데이터베이스 파티션 확인 실패: {}. 계속 진행합니다.", e);
+            // 파티션 확인 실패해도 계속 진행
         }
     }
     
@@ -255,26 +241,16 @@ async fn initialize_database() -> Result<(), Box<dyn Error>> {
 
 /// SSL 디렉토리 확인 및 생성
 fn ensure_ssl_directories(config: &Config) -> Result<(), Box<dyn Error>> {
-    // SSL 디렉토리 확인
-    let ssl_dir = Path::new(&config.ssl_dir);
-    if !ssl_dir.exists() {
-        info!("SSL 디렉토리가 없어 생성합니다: {}", config.ssl_dir);
-        std::fs::create_dir_all(ssl_dir)?;
-    }
+    let ssl_dir = &config.ssl_dir;
+    let cert_dir = format!("{}/certs", ssl_dir);
+    let key_dir = format!("{}/private", ssl_dir);
+    let trusted_dir = format!("{}/trusted_certs", ssl_dir);
     
-    // trusted_certs 디렉토리 확인
-    let trusted_certs_dir = ssl_dir.join("trusted_certs");
-    if !trusted_certs_dir.exists() {
-        info!("신뢰할 인증서 디렉토리가 없어 생성합니다: {}", trusted_certs_dir.display());
-        std::fs::create_dir_all(&trusted_certs_dir)?;
-        
-        // 사용자에게 안내 메시지 출력
-        info!("========== 인증서 검증 오류 해결 방법 ==========");
-        info!("사설 HTTPS 사이트에 접속 시 인증서 오류가 발생하는 경우:");
-        info!("1. 브라우저에서 해당 사이트의 인증서를 내보내기 (PEM 또는 CRT 형식)");
-        info!("2. 내보낸 인증서를 {} 디렉토리에 복사", trusted_certs_dir.display());
-        info!("3. 서버를 재시작하여 인증서를 로드");
-        info!("============================================");
+    for dir in &[ssl_dir, &cert_dir, &key_dir, &trusted_dir] {
+        if !Path::new(dir).exists() {
+            std::fs::create_dir_all(dir)?;
+            info!("디렉토리 생성: {}", dir);
+        }
     }
     
     Ok(())
